@@ -8,6 +8,8 @@
 
 // ---- core.cpp ---------------------------------------------------------------------------
 PPCFunc ppc_lookup(uint32_t addr);
+// The EFB read by the CPU (0xC8000000): the command processor's (gx.cpp), when there is one.
+extern uint32_t (*g_efb_peek)(uint32_t addr);
 // Optional: a symbols.tsv (python -m wiikit.dol GAME.elf --symbols) names
 // guest addresses in logs and crash reports.
 void rt_load_symbols(const char* tsv);
@@ -23,6 +25,14 @@ void rt_backtrace(const PPCContext& c, FILE* out, int max = 24);
 // the game starts. Its hooks come from the recompiler's --hooks file.
 struct RtGameLayer { RtGameLayer(const char* name, void (*install)()); };
 void rt_game_install();
+
+// ---- rso.cpp ----------------------------------------------------------------------------
+// RSO modules: the run-time address of a loaded module's code -> the virtual
+// one it was recompiled at (0 if no module is there); the module a virtual
+// address is in.
+uint32_t rso_virtual(uint32_t addr);
+const RsoModule* rso_module_at(uint32_t vaddr);
+void rso_install();                                // RSOLinkListFixed / RSOUnLinkList hooks
 
 // Registers of the guest code currently running on this host thread (for
 // crash reports and "who touched this register" logs). Set by the OS layer.
@@ -46,6 +56,7 @@ extern uint32_t g_bus_mhz;                        // 243 on the Wii, 162 on the 
 static inline uint64_t tb_hz() { return (uint64_t)g_bus_mhz * 250000; }
 
 // ---- the OS layer (os.cpp) --------------------------------------------------------------
+void os_report_running(int depth);                // stderr: where the running guest thread is
 void os_install();                                // hooks, time
 void os_start_main(uint32_t entry);               // run __start on a guest host thread, and return
 void os_raise();                                  // a device changed its interrupt line

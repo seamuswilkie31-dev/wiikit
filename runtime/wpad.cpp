@@ -75,11 +75,24 @@ void call(const PPCContext& c, uint32_t cb, uint32_t a, uint32_t b) {
     ppc_call_indirect(e, cb);
 }
 
+// Requests that finish later on a console (WPADControlDpd's): their
+// callback (chan, result) is called at the next delivery, never inside the
+// request.
+struct Done { uint32_t cb, chan; int32_t result; };
+Done done[8];
+int ndone = 0;
+void finish_later(uint32_t cb, uint32_t chan, int32_t result) {
+    if (cb && ndone < 8) done[ndone++] = {cb, chan, result};
+}
+
 bool delivering = false;
 // Tells the game of every change since it was last told, on its callbacks.
 void deliver(const PPCContext& c) {
-    if (delivering || !classic_game) return;         // a callback that probes: no nesting
+    if (delivering) return;                          // a callback that probes: no nesting
     delivering = true;
+    for (int i = 0; i < ndone; ++i) call(c, done[i].cb, done[i].chan, (uint32_t)done[i].result);
+    ndone = 0;
+    if (!classic_game) { delivering = false; return; }
     uint64_t now = os_tb_now();
     for (uint32_t i = 0; i < 4; ++i) {
         Channel& ch = chans[i];
@@ -246,6 +259,36 @@ void hle_WPADRead(PPCContext& c) {                   // (chan, void* status)
     if (c.r[3] < 4 && c.r[4]) write_status(c.r[3], c.r[4]);
 }
 
+// The data format a game asks of a Remote (WPADSetDataFormat(chan, fmt)):
+// kept and given back (WPADGetDataFormat(chan)); WPAD's own stick clamping,
+// which a game may run on the samples it reads, goes by it. Until the game
+// sets one, the format of what the channel holds.
+int32_t formats[4] = {-1, -1, -1, -1};
+
+void hle_WPADGetDataFormat(PPCContext& c) {
+    uint32_t chan = c.r[3];
+    int32_t f = chan < 4 ? formats[chan] : -1;
+    ret(c, f >= 0 ? (uint32_t)f : classic_game ? WPAD_FMT_CLASSIC_ACC_DPD : WPAD_FMT_CORE_ACC_DPD);
+}
+
+void hle_WPADSetDataFormat(PPCContext& c) {
+    uint32_t chan = c.r[3];
+    if (chan < 4) formats[chan] = (int32_t)c.r[4];
+    ret(c, present(chan) ? (uint32_t)WPAD_ERR_NONE : (uint32_t)WPAD_ERR_NO_CONTROLLER);
+}
+
+// The pointing camera (DPD): on or off as the game asks; a request's
+// callback is called later, as the Remote answers.
+bool dpd_on[4] = {};
+
+void hle_WPADControlDpd(PPCContext& c) {             // (chan, command: 0 off, else a mode, cb)
+    uint32_t chan = c.r[3];
+    if (!present(chan)) { ret(c, (uint32_t)WPAD_ERR_NO_CONTROLLER); return; }
+    dpd_on[chan] = c.r[4] != 0;
+    finish_later(c.r[5], chan, WPAD_ERR_NONE);
+    ret(c, WPAD_ERR_NONE);
+}
+
 void hle_WPADSetAutoSamplingBuf(PPCContext& c) {     // (chan, void* buf, u32 len)
     if (c.r[3] < 4) rings[c.r[3]] = {c.r[4], c.r[5]};
 }
@@ -306,7 +349,8 @@ void wpad_install() {
         deliver(saved);
     });
     // other callbacks: accepted, never called; the previous one returned is none
-    for (const char* n : {"WPADSetSimpleSyncCallback", "WPADIsUsedCallbackByKPAD", "WPADIsSpeakerEnabled",
+    // (the sampling callback would come at every sample: games poll instead)
+    for (const char* n : {"WPADSetSimpleSyncCallback", "WPADSetSamplingCallback", "WPADIsUsedCallbackByKPAD", "WPADIsSpeakerEnabled",
                           "WPADCanSendStreamData", "WPADGetSensorBarPosition", "WPADGetRadioSensitivity",
                           "WPADStartFastSimpleSync", "WPADStopSimpleSync", "KPADIsEnableAimingMode"})
         ppc_hook(n, zero);
@@ -319,6 +363,16 @@ void wpad_install() {
     ppc_hook("KPADGetSensorHeight", hle_KPADGetSensorHeight);
     ppc_hook("WPADRead", hle_WPADRead);
     ppc_hook("WPADSetAutoSamplingBuf", hle_WPADSetAutoSamplingBuf);
+    ppc_hook("WPADGetDataFormat", hle_WPADGetDataFormat);
+    ppc_hook("WPADControlDpd", hle_WPADControlDpd);
+    ppc_hook("WPADIsDpdEnabled", [](PPCContext& c) { c.r[3] = c.r[3] < 4 && dpd_on[c.r[3]]; });
+    ppc_hook("WPADGetDpdSensitivity", [](PPCContext& c) { c.r[3] = 3; });   // SYSCONF's IR sensitivity, as shipped
+    // an accelerometer's 1 g in its own counts (x, y, z as s16), from the
+    // Remote's calibration: a typical Remote's
+    ppc_hook("WPADGetAccGravityUnit", [](PPCContext& c) {   // (chan, type, WPADAcc*)
+        if (c.r[5]) { st16(c.r[5], 104); st16(c.r[5] + 2, 104); st16(c.r[5] + 4, 104); }
+    });
+    ppc_hook("WPADSetDataFormat", hle_WPADSetDataFormat);
     ppc_hook("WPADGetLatestIndexInBuf", hle_WPADGetLatestIndexInBuf);
     ppc_hook("kpad_wpad_status", hle_kpad_wpad_status);
 }

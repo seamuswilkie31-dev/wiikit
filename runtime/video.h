@@ -46,6 +46,11 @@ bool video_submit(std::vector<uint8_t>& rec, int frames, int wait_ms = -1);
 void video_set_xfb(uint32_t top_field_addr); // VI: the XFB being scanned out (physical)
 void video_retrace();                        // VI: a vertical retrace happened
 void video_set_lines(uint32_t lines);        // VI: lines of picture scanned out (of 480 for NTSC)
+// The EFB as the CPU reads it (GXPeekARGB, GXPeekZ at 0xC8000000): once
+// everything submitted so far is drawn, the EFB read back at its native
+// 640 x 528, ARGB and 24-bit Z per pixel, rows top first. Waits for the
+// renderer; false with --no-video.
+bool video_efb_read(std::vector<uint32_t>& argb, std::vector<uint32_t>& z);
 
 struct VideoOptions {
     bool enabled = true;

@@ -108,6 +108,7 @@ int main(int argc, char** argv) {
     audio_init(audio);
     if (!gamecube) ios_init(root.c_str(), nand.c_str());
     os_install();
+    rso_install();
     if (!gamecube) wpad_install();
     rt_game_install();
     if (watch) os_watch(watch);

@@ -21,6 +21,10 @@ __OSReboot
 # the MMU: nothing to configure on a flat address space
 RealMode               # rfi into a real-mode routine that sets the BATs
 
+# RSO modules recompiled with the executable (rso.cpp): where the game loads them
+RSOLinkListFixed       # RSOLinkList's body: locates and links a module
+RSOUnLinkList
+
 # the Wii Remote: the public WPAD and KPAD API (wpad.cpp); the Bluetooth
 # stack below it never starts
 WPADInit
@@ -31,6 +35,13 @@ WPADDisconnect
 WPADSetAutoSamplingBuf
 WPADGetLatestIndexInBuf
 WPADRead
+WPADGetDataFormat
+WPADSetDataFormat
+WPADSetSamplingCallback
+WPADControlDpd
+WPADIsDpdEnabled
+WPADGetDpdSensitivity
+WPADGetAccGravityUnit
 WPADSetCallbackByKPAD
 WPADIsUsedCallbackByKPAD
 WPADSetConnectCallback

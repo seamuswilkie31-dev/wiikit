@@ -24,7 +24,8 @@
 //
 // Devices so far: /dev/di (the disc, from the extracted tree), /dev/fs and
 // file paths (NAND, on a host folder), /dev/es (title identity, ticket and
-// TMD views), /dev/stm/immediate and /dev/stm/eventhook. Anything else fails
+// TMD views), /dev/stm/immediate and /dev/stm/eventhook, /dev/usb/hid (no
+// keyboard ever attached). Anything else fails
 // to open, and every call a device does not know is logged.
 #include "disc.h"
 #include "rt.h"
@@ -346,6 +347,33 @@ struct STMEventHook : Device {
     }
 };
 
+// /dev/usb/hid: USB devices of the HID class (keyboards), version 4. There
+// is always the device, never a keyboard on it: the first GetDeviceChange
+// answers at once with an empty list, the next waits for a change that never
+// comes, until Shutdown releases it.
+struct USBHID : Device {
+    bool listed = false;
+    uint32_t waiting = 0;                             // the pending GetDeviceChange
+    int32_t ioctl(uint32_t req, uint32_t in, uint32_t in_len, uint32_t out, uint32_t out_len, uint32_t addr) override {
+        switch (req) {
+        case 0:                                       // GetDeviceChange: the attached devices, -1 ended
+            if (!listed) {
+                listed = true;
+                if (out && out_len >= 4) wr32(out, 0xFFFFFFFFu);
+                return 0;
+            }
+            waiting = addr;
+            return PENDING;
+        case 6: return 0x40001;                       // GetVersion: 4.1
+        case 7: return 0;                             // CancelInterrupt: none can be pending
+        case 8:                                       // Shutdown
+            if (waiting) { reply(waiting, -1); waiting = 0; }
+            return 0;
+        }
+        return Device::ioctl(req, in, in_len, out, out_len, addr);
+    }
+};
+
 std::unique_ptr<Device> make_device(const std::string& path) {
     std::unique_ptr<Device> d;
     if (path == "/dev/di") d = std::make_unique<DI>();
@@ -353,6 +381,7 @@ std::unique_ptr<Device> make_device(const std::string& path) {
     else if (path == "/dev/es") d = std::make_unique<ES>();
     else if (path == "/dev/stm/immediate") d = std::make_unique<STMImmediate>();
     else if (path == "/dev/stm/eventhook") d = std::make_unique<STMEventHook>();
+    else if (path == "/dev/usb/hid") d = std::make_unique<USBHID>();
     else if (!path.empty() && path[0] == '/' && path.rfind("/dev/", 0) != 0) d = std::make_unique<NandFile>();
     if (d) d->name = path;
     return d;

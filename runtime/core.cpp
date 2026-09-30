@@ -27,7 +27,10 @@ PPCFunc ppc_lookup(uint32_t addr) {
         size_t mid = (lo + hi) / 2;
         if (g_ppc_funcs[mid].addr < addr) lo = mid + 1; else hi = mid;
     }
-    return lo < g_ppc_nfuncs && g_ppc_funcs[lo].addr == addr ? g_ppc_funcs[lo].fn : nullptr;
+    if (lo < g_ppc_nfuncs && g_ppc_funcs[lo].addr == addr) return g_ppc_funcs[lo].fn;
+    // a loaded RSO module's code: recompiled at a virtual address
+    if (uint32_t v = rso_virtual(addr)) return ppc_lookup(v);
+    return nullptr;
 }
 
 // WIIKIT_ICALLS=1: indirect calls (bctrl, blrl: virtual calls, callbacks, a
@@ -97,8 +100,14 @@ uint32_t ppc_symbol(const char* name) {
 }
 
 // ---- above 0xC0000000 ---------------------------------------------------------------------
+uint32_t (*g_efb_peek)(uint32_t addr) = nullptr;
+
 uint32_t ppc_io_read(uint32_t a, int size) {
     if ((a & 0xFE000000u) == 0xCC000000u) return ppc_mmio_read(a, size);
+    if ((a & 0xFF000000u) == 0xC8000000u) {            // the EFB, as the CPU reads it
+        uint32_t v = g_efb_peek ? g_efb_peek(a & ~3u) : 0;
+        return size == 4 ? v : size == 2 ? v >> (16 - 8 * (a & 2)) & 0xFFFF : v >> (24 - 8 * (a & 3)) & 0xFF;
+    }
     uint8_t* p = host(a);
     switch (size) {
     case 1: return *p;
@@ -109,6 +118,11 @@ uint32_t ppc_io_read(uint32_t a, int size) {
 
 void ppc_io_write(uint32_t a, uint32_t v, int size) {
     if ((a & 0xFE000000u) == 0xCC000000u) { ppc_mmio_write(a, v, size); return; }
+    if ((a & 0xFF000000u) == 0xC8000000u) {            // the EFB written by the CPU (GXPoke*): not kept
+        static bool told = false;
+        if (!told) { told = true; rt_log("wiikit: the CPU writes the EFB (%08X): ignored", a); }
+        return;
+    }
     uint8_t* p = host(a);
     switch (size) {
     case 1: *p = (uint8_t)v; break;
@@ -198,6 +212,13 @@ std::string rt_name(uint32_t a) {
             return n + buf;
         }
     }
+    if (const RsoModule* m = rso_module_at(a)) {       // a module's code, recompiled
+        std::string n = m->name;
+        n = n.substr(n.find_last_of("\\/") + 1);
+        std::snprintf(buf, sizeof buf, "+0x%X", a - m->vbase);
+        return n + buf;
+    }
+    if (uint32_t v = rso_virtual(a)) return rt_name(v) + " (loaded)";
     std::snprintf(buf, sizeof buf, "%08X", a);
     return buf;
 }

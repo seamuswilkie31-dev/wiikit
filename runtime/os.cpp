@@ -484,6 +484,17 @@ void os_install() {
     std::thread(clock_main).detach();
 }
 
+// Where the running guest thread is: its registers' summary and call chain.
+void os_report_running(int depth) {
+    std::lock_guard<std::mutex> lk(g_mx);
+    HostThread* h = g_running;
+    if (!h) { std::fprintf(stderr, "  no guest thread running\n"); return; }
+    const PPCContext& c = *h->cur;
+    std::fprintf(stderr, "  thread %08X, msr %08X, pending %u, %zu interrupt(s) deep\n",
+                 h->ctx, c.msr, g_ppc_pending.load(), h->delivering.size());
+    rt_backtrace(c, stderr, depth);
+}
+
 // --watch: every few seconds, where the running guest thread is
 void watch_main(int seconds) {
     for (;;) {

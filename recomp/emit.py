@@ -16,8 +16,37 @@ def fname(addr):
     return f"f_{addr:08X}"
 
 
+class Expr:
+    """An immediate known only at run time (a relocated module's, read from
+    the loaded code): stands in for the decoded field, as C++ text."""
+
+    def __init__(self, cxx):
+        self.cxx = cxx
+
+    def __lshift__(self, n):
+        return Expr(f"({self.cxx} << {n})")
+
+    def __eq__(self, other):              # never a literal 0: `d == 0` keeps rA + d
+        return False
+
+    __hash__ = object.__hash__
+
+
 def _h(v):
+    if isinstance(v, Expr):
+        return f"(uint32_t)({v.cxx})"
     return f"0x{v & 0xFFFFFFFF:X}u"
+
+
+def _relocated(ins, f, half):
+    """`f` with its 16-bit immediate replaced by `half`, the C++ expression of
+    the halfword the loaded instruction holds."""
+    f = dict(f)
+    signed = ins.op != "cmpli"
+    for k in ("simm", "d", "uimm", "imm"):
+        if k in f:
+            f[k] = Expr(f"(int32_t)(int16_t){half}" if signed and k != "uimm" else f"(uint32_t){half}")
+    return f
 
 
 def _mask(mb, me):
@@ -118,6 +147,9 @@ def emit(ins, addr, fn):
     op, f = ins.op, ins.f
     nxt = addr + 4
     rc = f.get("Rc")
+    half = fn.relocated_half(addr) if hasattr(fn, "relocated_half") else None
+    if half:
+        f = _relocated(ins, f, half)
 
     # ---- branches -------------------------------------------------------------------
     if op == "b":
@@ -146,7 +178,8 @@ def emit(ins, addr, fn):
             act = f"{{ c.lr = {_h(nxt)}; ppc_call_indirect(c, c.ctr); }}"
         elif not cond and addr in fn.tables:
             cases = " ".join(f"case {_h(t)}: goto L_{t:08X};" for t in sorted(set(fn.tables[addr])))
-            return [f"switch (c.ctr) {{ {cases} default: ppc_call_indirect(c, c.ctr); return; }}"]
+            ctr = fn.code_address("c.ctr") if hasattr(fn, "code_address") else "c.ctr"
+            return [f"switch ({ctr}) {{ {cases} default: ppc_call_indirect(c, c.ctr); return; }}"]
         else:
             act = "{ ppc_call_indirect(c, c.ctr); return; }"
         return [f"{{ {pre}if ({cond}) {act} }}" if cond else f"{{ {pre}{act} }}"]

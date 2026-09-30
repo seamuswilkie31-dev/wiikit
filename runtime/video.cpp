@@ -45,7 +45,7 @@ constexpr int EFB_W = 640, EFB_H = 528;
 using Clock = std::chrono::steady_clock;
 
 // ---- the queue from the game ------------------------------------------------------------------
-struct Chunk { std::vector<uint8_t> data; int frames; };
+struct Chunk { std::vector<uint8_t> data; int frames; bool readback = false; };
 std::mutex qmx;
 std::condition_variable q_space;
 std::deque<Chunk> q;
@@ -53,6 +53,11 @@ std::vector<std::vector<uint8_t>> spare;           // record buffers to reuse (u
 int q_frames = 0;
 SDL_Semaphore* wake = nullptr;
 std::atomic<uint32_t> xfb_addr{0}, retraces{0}, vi_lines{480};
+// an EFB read-back asked for by the CPU (video_efb_read), done in the queue's order
+std::mutex rb_mx;
+std::condition_variable rb_cv;
+bool rb_ready = false;
+std::vector<uint32_t>*rb_argb = nullptr, *rb_z = nullptr;
 std::mutex pad_mx;
 PadState pad;
 ClassicState classic[4];
@@ -578,6 +583,30 @@ void draw(uint8_t prim, uint8_t vflags, const uint8_t* pieces, uint32_t npieces)
 
 // ---- the record -----------------------------------------------------------------------------------
 template <class T> T rd(const uint8_t*& p) { T v; std::memcpy(&v, p, sizeof v); p += sizeof v; return v; }
+
+// The EFB at its native size: the pixel at each native position's top-left
+// sample of the scaled EFB (rows from the top, as the EFB copies read it).
+void efb_readback() {
+    int W = EFB_W * S, H = EFB_H * S;
+    std::vector<uint8_t> px((size_t)W * H * 4);
+    std::vector<float> dz((size_t)W * H);
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, efb_fbo);
+    glPixelStorei(GL_PACK_ALIGNMENT, 1);
+    glReadPixels(0, 0, W, H, GL_RGBA, GL_UNSIGNED_BYTE, px.data());
+    glReadPixels(0, 0, W, H, GL_DEPTH_COMPONENT, GL_FLOAT, dz.data());
+    std::lock_guard<std::mutex> lk(rb_mx);
+    rb_argb->resize((size_t)EFB_W * EFB_H);
+    rb_z->resize((size_t)EFB_W * EFB_H);
+    for (int y = 0; y < EFB_H; ++y)
+        for (int x = 0; x < EFB_W; ++x) {
+            size_t s = (size_t)y * S * W + (size_t)x * S, d = (size_t)y * EFB_W + x;
+            const uint8_t* c = &px[s * 4];
+            (*rb_argb)[d] = (uint32_t)c[3] << 24 | (uint32_t)c[0] << 16 | (uint32_t)c[1] << 8 | c[2];
+            (*rb_z)[d] = (uint32_t)(std::clamp(dz[s], 0.0f, 1.0f) * 16777215.0f);
+        }
+    rb_ready = true;
+    rb_cv.notify_all();
+}
 
 void exec(const std::vector<uint8_t>& data) {
     const uint8_t* p = data.data();
@@ -1274,6 +1303,29 @@ bool video_submit(std::vector<uint8_t>& rec, int frames, int wait_ms) {
     return true;
 }
 
+bool video_efb_read(std::vector<uint32_t>& argb, std::vector<uint32_t>& z) {
+    if (!opt.enabled) return false;
+    std::unique_lock<std::mutex> lk(rb_mx);
+    rb_argb = &argb;
+    rb_z = &z;
+    rb_ready = false;
+    {
+        std::lock_guard<std::mutex> ql(qmx);
+        q.push_back(Chunk{{}, 0, true});
+    }
+    if (wake) SDL_SignalSemaphore(wake);
+    // the console's CPU takes its interrupts while it waits: so does this wait
+    while (!rb_ready) {
+        rb_cv.wait_for(lk, std::chrono::milliseconds(1));
+        if (!rb_ready && t_ppc && g_ppc_pending.load(std::memory_order_relaxed)) {
+            lk.unlock();
+            ppc_poll(*t_ppc);
+            lk.lock();
+        }
+    }
+    return true;
+}
+
 void video_set_xfb(uint32_t a) { xfb_addr.store(a); }
 void video_set_lines(uint32_t n) { vi_lines.store(n); }
 std::atomic<bool> want_relative{false};
@@ -1423,6 +1475,7 @@ void video_run(const char* title) {
                 c = std::move(q.front());
                 q.pop_front();
             }
+            if (c.readback) { efb_readback(); busy = true; continue; }
             auto te = Clock::now();
             exec(c.data);
             if (g_vperf_on) g_vperf.draw += (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - te).count();

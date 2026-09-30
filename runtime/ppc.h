@@ -51,6 +51,9 @@ typedef void (*PPCFunc)(PPCContext&);
 struct PPCFuncEntry { uint32_t addr; PPCFunc fn; };
 struct PPCHook { const char* name; uint32_t addr; PPCFunc orig; PPCFunc* slot; };
 struct PPCSymbol { const char* name; uint32_t addr; };
+// An RSO module recompiled with the executable: its name (the header's) and
+// where the recompiler linked it (wiikit/rso.py, runtime/rso.cpp).
+struct RsoModule { const char* name; uint32_t vbase; uint32_t size; };
 
 // ---- services provided by the runtime ------------------------------------------------
 extern uint8_t* g_mem;

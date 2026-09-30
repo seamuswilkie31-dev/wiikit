@@ -23,6 +23,7 @@
 #include "gxtex.h"
 #include "video.h"
 #include <algorithm>
+#include <mutex>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -91,7 +92,9 @@ bool video = false;
 std::vector<uint8_t> rec;
 int rec_frames = 0;
 
+uint64_t rec_total = 0;                            // bytes ever recorded: what the EFB may have seen
 uint8_t* grow(size_t n) {
+    rec_total += n;
     size_t o = rec.size();
     rec.resize(o + n);
     return rec.data() + o;
@@ -600,7 +603,30 @@ void feed(const uint8_t* b, int n) {
 
 void gx_trace_next_frame() { trace_next = true; }
 
-void gx_init() { video = video_enabled(); }
+// The EFB as the CPU reads it: 0xC8000000 | y << 12 | x << 2, bit 22 for Z
+// (GXPeekARGB, GXPeekZ; a game reads the picture's brightness so). The
+// record so far is handed over, and the renderer reads the EFB back once it
+// has drawn it; peeks read that copy until anything more is recorded.
+uint32_t gx_efb_peek(uint32_t a) {
+    static std::mutex mx;
+    static std::vector<uint32_t> argb, z;
+    static uint64_t at = UINT64_MAX;
+    std::lock_guard<std::mutex> lk(mx);
+    if (at != rec_total) {
+        hw_run_locked([] { if (!rec.empty()) submit_pending = true; });
+        gx_submit_pending();
+        if (!video_efb_read(argb, z)) return 0;
+        at = rec_total;
+    }
+    uint32_t x = a >> 2 & 0x3FF, y = a >> 12 & 0x3FF;
+    if (x >= 640 || y >= 528) return 0;
+    return (a & 0x400000u ? z : argb)[y * 640 + x];
+}
+
+void gx_init() {
+    video = video_enabled();
+    g_efb_peek = gx_efb_peek;
+}
 
 // While the renderer is behind, the game's thread waits here; the console's
 // CPU never waits for its GP, and would take its interrupts meanwhile: the
