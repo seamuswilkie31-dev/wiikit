@@ -24,6 +24,7 @@ the ports.
 | [pc-conduit2](https://github.com/vs-sr-dev/pc-conduit2) | Conduit 2 (2011) | the 2010 SDK's KPAD Ex forms, IOS replies after the call (a NAND race), the GP FIFO and display lists in MEM2, RG8/GB8 EFB copies, the relative mouse, the Classic Controller and SDL gamepads (split-screen), the F12 GX trace |
 | [pc-arcrisefantasia](https://github.com/vs-sr-dev/pc-arcrisefantasia) | Arc Rise Fantasia (2009) | the 2007 SDK's KPAD and WPAD (the Classic read from WPAD's own samples, and from the copy of them only that KPAD keeps), thousands of tiny skinned strips merged into single draws, the disc's files sized from the FST, the renderer's profiler |
 | [pc-megamanxcm](https://github.com/vs-sr-dev/pc-megamanxcm) | Mega Man X: Command Mission (2004, GameCube, PAL) | the GameCube: its discs, its clocks and the IPL's globals, the disc drive at its registers, 16 MB of ARAM, the controllers on SI, the GameCube's AX micro-code under MusyX (samples in ARAM, per-millisecond updates), drive and DMA times as long as the console's |
+| [pc-monsterhunter3](https://github.com/vs-sr-dev/pc-monsterhunter3) | Monster Hunter Tri (2009, PAL) | RSO modules (most of its code, loaded at run time) recompiled with the executable, the WPAD data format and pointing camera, USB keyboards' `/dev/usb/hid`, the CPU's reads of the EFB, the AI clock waiting for the DSP's interrupt |
 
 Some pieces were first written for two earlier Wii studies (The Last Story
 and Final Fantasy Crystal Chronicles: The Crystal Bearers): the disc
@@ -50,9 +51,12 @@ python -m wiikit.dol build/extract/sys/main.dol --info
 python -m wiikit.ppc build/extract/sys/main.dol --at 80006124
 python -m wiikit.cw 'process__19CSongMoveBlockActorFf'
 python -m wiikit.u8 ARCHIVE.arc
+python -m wiikit.rso MODULE.rso [--exports|--imports|--relocs]   # an RSO module or a .sel
 python -m wiikit.tpl TEXTURE.tpl build/out
 python -m wiikit.recomp GAME.elf --out build/recomp [--hooks game-hooks.txt]
 python -m wiikit.recomp main.dol --out build/recomp --symbols names.tsv   # stripped
+python -m wiikit.recomp main.dol --out build/recomp --symbols names.tsv \
+    --sel files/GAME.sel --rso files/MODULE.rso ...                      # with its RSO modules
 python -m wiikit.profile build/recomp-build/wiiboot.exe run.err [build/symbols.tsv]
 ```
 
@@ -67,9 +71,9 @@ its own layer (`RtGameLayer`) with `-DWIIKIT_EXTRA=file.cmake`.
 |---|---|---|---|
 | 1. Recognise | What is on this disc? | `disc --info`: game id, Wii or GameCube, partitions, WBFS usage; `rvz`: RVZ/WIA tables | a `fingerprint`: magics, SDK library dates, middleware found by symbol or string (Scaleform, Wwise, Bink, NW4R, Home Button) |
 | 2. Extract | Turn standard formats into standard files | `disc` (ISO, WBFS, RVZ and WIA; AES, FST; GameCube discs), `u8`, `tpl`, `gxtex`, `dsp` | palette formats C4/C8/C14X2 in Python (the runtime's C++ `gxtex` has them), BRSTM/BRSAR, THP, BNR |
-| 3. Map code | What does the code do, where? | `dol` (DOL and ELF, one address map, symbols, `--same-as`, `--libs`), `cw` (CodeWarrior demangler), `ppc` (Gekko decoder with paired singles, disassembly, callers, lis/addi and SDA xrefs, instruction census) | `ppc --mix` without symbols; `sig`: library functions named by signature in stripped executables (Dolphin's `.dsy`, symbolised ELFs) |
-| 4. Translate | Turn Gekko code into C++ | `recomp`: units and entry points to a fixed point, switch tables, one C++ function per entry, dispatch table, CMake project; stripped executables: function discovery (`recomp/discover.py`), switch tables sized from the code, names and hooks from a `symbols.tsv` | faithful single-precision rounding |
-| 5. Runtime | Replace the hardware | `ppc.h` (the CPU model), `core`/`mem` (guest space, dispatch, hooks), `os` (guest threads on host threads, interrupts, time), `hw` (PI, VI, DSP micro-codes, AI, EXI, SI, Hollywood; for a GameCube game the disc drive at its registers, 16 MB of ARAM, the controllers on SI), `gx` (FIFO parsing, vertex and texture decoding, the record), `gxtex`, `gxshader` (TEV and XF to GLSL), `video` (SDL3 window, OpenGL 4.5 renderer), `ios` + `disc` (IOS HLE at the IPC registers), `sysconf`, `boot`, `wpad` (the Wii Remote on the mouse and keys; the Classic Controller on keys and SDL gamepads, up to four, in KPAD's status and WPAD's own samples; the connect and extension callbacks), `ax` (the AX micro-code, the Wii's and the GameCube's: its 5 ms frames, its per-millisecond updates, samples in ARAM) and `audio` (SDL3 output), a port's own layer (`RtGameLayer`), a sampling profiler, and `wiiboot` (the console from the disc: a GameCube game gets its 162 MHz bus and the IPL's globals, no IOS) | memory cards on EXI, the GameCube's second DSP task (the memory card's unlock), the early (2006–07) AX micro-code, locked-cache DMA, synthetic Remote motion (swing, thrust, shake) from mouse gestures, fog and Z textures, Dolphin as the oracle |
+| 3. Map code | What does the code do, where? | `dol` (DOL and ELF, one address map, symbols, `--same-as`, `--libs`), `rso` (the SDK's RSO modules and the static module's `.sel`: sections, relocations, exports and imports by name), `cw` (CodeWarrior demangler), `ppc` (Gekko decoder with paired singles, disassembly, callers, lis/addi and SDA xrefs, instruction census) | `ppc --mix` without symbols; `sig`: library functions named by signature in stripped executables (Dolphin's `.dsy`, symbolised ELFs) |
+| 4. Translate | Turn Gekko code into C++ | `recomp`: units and entry points to a fixed point, switch tables, one C++ function per entry, dispatch table, CMake project; stripped executables: function discovery (`recomp/discover.py`), switch tables sized from the code, names and hooks from a `symbols.tsv`, a `symbols.tsv` of every unit written for the runtime's logs; RSO modules linked at virtual addresses into the executable's image and recompiled with it, their relocated immediates read from the module the game loaded | faithful single-precision rounding |
+| 5. Runtime | Replace the hardware | `ppc.h` (the CPU model), `core`/`mem` (guest space, dispatch, hooks, the CPU's reads of the EFB), `rso` (where the game linked each RSO module: its code's run-time addresses made virtual), `os` (guest threads on host threads, interrupts, time), `hw` (PI, VI, DSP micro-codes, AI, EXI, SI, Hollywood; for a GameCube game the disc drive at its registers, 16 MB of ARAM, the controllers on SI), `gx` (FIFO parsing, vertex and texture decoding, the record), `gxtex`, `gxshader` (TEV and XF to GLSL), `video` (SDL3 window, OpenGL 4.5 renderer), `ios` + `disc` (IOS HLE at the IPC registers), `sysconf`, `boot`, `wpad` (the Wii Remote on the mouse and keys; the Classic Controller on keys and SDL gamepads, up to four, in KPAD's status and WPAD's own samples; the connect and extension callbacks), `ax` (the AX micro-code, the Wii's and the GameCube's: its 5 ms frames, its per-millisecond updates, samples in ARAM) and `audio` (SDL3 output), a port's own layer (`RtGameLayer`), a sampling profiler, and `wiiboot` (the console from the disc: a GameCube game gets its 162 MHz bus and the IPL's globals, no IOS) | memory cards on EXI, the GameCube's second DSP task (the memory card's unlock), the early (2006–07) AX micro-code, locked-cache DMA, synthetic Remote motion (swing, thrust, shake) from mouse gestures, fog and Z textures, Dolphin as the oracle |
 
 How the recompiler, the runtime, the renderer and the audio work is
 written up, with Victorious as the case, in pc-victorious's
@@ -102,6 +106,7 @@ written up, with Victorious as the case, in pc-victorious's
 | `cw` | 20 619 of 20 619 function names demangled, including templates, conversion operators and anonymous namespaces |
 | `ppc` | Victorious: 1 658 815 instructions, none undecoded; equal to capstone on every non-paired-single instruction up to standard aliases; paired-single fields checked by prologue/epilogue symmetry in 1 393 functions. A stripped 2007 DOL: 744 768 words, 14 non-zero words undecoded (data in text) |
 | `gxtex` | The Last Story: byte-identical to textures Dolphin dumped from the running game |
+| `rso` | Monster Hunter Tri's 21 modules and its `.sel`: every relocation one of four kinds (ADDR32 in data, ADDR16_HA/LO on instructions' immediates, REL24 on branches), every import resolved by the `.sel`; 919 exports of `.text` each at a function start of the DOL |
 | `tpl`, `u8` | the Home Button archives (105 files; the icon decodes correctly) |
 | `dsp` | Crystal Bearers' audio, by ear and spectrogram |
 | `recomp/discover` | Victorious's DOL against its ELF: 20 612 of 20 619 function starts found; 0 units cut through a function (no branch of any function crosses a unit start); 353 units of dead code after tail calls, harmless. A stripped 2007 PAL DOL: 8 738 units, 332 switch tables sized from the code (3 unresolved), no branch to an unknown target. Victorious's generated C++ unchanged, 201 of 201 files |
@@ -112,10 +117,14 @@ written up, with Victorious as the case, in pc-victorious's
 | `runtime` (Remote) | Victorious, by hand: its first episode played with the mouse, the pointer under the mouse, the rhythm game's presses, holds and shakes |
 | `runtime` (GameCube) | a stripped 2004 GameCube game, from `__start` to its opening scenes: the SDK's own `OSInit` report ("Console Type : Retail 3", 24 MB), its disc read through the drive's registers, ARAM sized by ARInit's own check, its controller found, polled and played with scripted presses, its logos, title, menu and real-time scenes at 50 frames a second |
 | `runtime` (GameCube audio) | the same game, by ear: its music streamed through ARAM, its effects and voices, its opening movie's sound; a movie that waits for its sound now plays |
+| `recomp` + `runtime` (RSO) | Monster Hunter Tri: its executable and 21 modules, 1.59 M instructions, recompiled and linked at the first try; its modules linked by the game at addresses of its choosing, relinked elsewhere as it moves between the village and a quest, their code, virtual methods and `_prolog`s run from the recompiled copy, by hand into a quest |
 | `runtime` (Classic Controller) | a stripped 2010 game that learns of controllers only from the connect callback, by hand: played with an Xbox One pad, and with the keys, the mouse and the pad at once. A stripped 2009 game that reads the Classic from WPAD's raw samples (the 2007 KPAD's copy of them, `WPADGetLatestIndexInBuf`): played with the same pad into its first battle |
 
 ## Known gaps
 
+* Monster Hunter Tri's sound has short gaps: AX skips a frame when its
+  DSP is not yet ready at the AI interrupt (the task manager's resume is a
+  lead).
 * `ppc.text` renders standard simplified mnemonics (`sub`, `clrrwi`, `mr.`,
   `crclr`…). Tools that need the canonical operation use `decode()`'s
   `op` and fields, never the text.
