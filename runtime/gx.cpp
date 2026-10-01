@@ -10,8 +10,12 @@
 // attribute format (VAT).
 //
 // The GP is always idle: it has consumed everything written. That answers
-// what the SDK waits for: PE "draw done" and tokens, with their interrupts,
-// and FIFO breakpoints (always set at data already written), reached at once.
+// what the SDK waits for: PE "draw done" and tokens, with their interrupts.
+// Except at a FIFO breakpoint: there the GP stops, as on the console, and
+// what the CPU writes beyond it waits until the breakpoint is moved or
+// cleared. A game may pace itself so (a frame's end as the breakpoint, its
+// draw-sync token just after: the token must not arrive before the game has
+// let the GP past the frame).
 // Whatever the renderer needs from guest memory is therefore read here, at
 // the moment the game believes the GP read it (video.h): vertices decoded
 // through the arrays, textures decoded to RGBA through TMEM's palettes and
@@ -72,7 +76,17 @@ FILE* trace_file() {
 // CP control: 0 GP read enable, 1 breakpoint enable, 2/3 overflow/underflow
 // interrupt enable, 4 GP link enable, 5 breakpoint interrupt enable
 bool linked() { return (cp_reg16[1] & 0x11) == 0x11; }
-bool bp_reached() { return (cp_reg16[1] & 0x3) == 0x3; }
+bool bp_enabled() { return (cp_reg16[1] & 0x3) == 0x3; }
+uint32_t bp_addr() { return (uint32_t)(cp_reg16[0x1F] & 0x3FFF) << 16 | cp_reg16[0x1E]; }   // CP 0x3C, 0x3E
+
+// Bursts the GP has not read: written past an enabled breakpoint. Each
+// keeps the FIFO address it was written at; the GP stops at the burst the
+// breakpoint names. With none held, the GP is at the write pointer.
+struct Burst { uint32_t addr; uint8_t b[32]; };
+std::vector<Burst> held;
+uint32_t pi_wptr_addr() { return pi_wptr & 0x1FFFFFFFu; }
+uint32_t gp_rptr() { return held.empty() ? pi_wptr_addr() : held.front().addr; }
+bool bp_reached() { return bp_enabled() && gp_rptr() == bp_addr(); }
 
 uint32_t be32(const uint8_t* p) { return (uint32_t)p[0] << 24 | p[1] << 16 | p[2] << 8 | p[3]; }
 uint16_t be16(const uint8_t* p) { return (uint16_t)(p[0] << 8 | p[1]); }
@@ -656,7 +670,22 @@ void gx_submit_pending() {
 // the end, not when it is past it: GXRedirectWriteGatherPipe sets base 0, end
 // 0x04000000 and points the pipe at a buffer that may lie in MEM2, above it.
 constexpr uint32_t PI_ADDR = 0x1FFFFFFFu, PI_WRAP = 0x20000000u;
+
+// The GP reads what is held up to the breakpoint, or all of it once the
+// breakpoint is moved or cleared; nothing while its reading is disabled
+// (the SDK disables it while it moves the breakpoint).
+static void gp_run() {
+    if (!(cp_reg16[1] & 1)) return;
+    size_t k = 0;
+    while (k < held.size() && !(bp_enabled() && held[k].addr == bp_addr())) {
+        feed(held[k].b, 32);
+        ++k;
+    }
+    held.erase(held.begin(), held.begin() + (ptrdiff_t)k);
+}
+
 void gx_pipe_burst(const uint8_t* b, int n) {
+    uint32_t at = pi_wptr_addr();
     for (int i = 0; i < n; ++i) {
         uint32_t a = pi_wptr & PI_ADDR;
         *host(virt(a)) = b[i];
@@ -664,16 +693,24 @@ void gx_pipe_burst(const uint8_t* b, int n) {
         if (pi_end && a == (pi_end & PI_ADDR)) pi_wptr = (pi_base & PI_ADDR) | PI_WRAP;
         else pi_wptr = (pi_wptr & PI_WRAP) | a;
     }
-    if (linked()) feed(b, n);
+    if (!linked()) return;
+    if (held.empty() && !(bp_enabled() && at == bp_addr())) { feed(b, n); return; }
+    Burst h{at, {}};
+    std::memcpy(h.b, b, 32);
+    held.push_back(h);
+    if (bp_reached()) os_raise();                  // the GP has come to the breakpoint
 }
 
 uint32_t gx_pi_fifo_read(uint32_t off) {
     return off == 0x0C ? pi_base : off == 0x10 ? pi_end : pi_wptr;
 }
+// The PI keeps its FIFO pointers in 32-byte units, as the pipe writes: the
+// SDK's FIFO end is base + size - 4, and the pipe wraps at the burst that
+// would reach it, never in the middle of one.
 void gx_pi_fifo_write(uint32_t off, uint32_t v) {
-    if (off == 0x0C) pi_base = v;
-    else if (off == 0x10) pi_end = v;
-    else if (off == 0x14) pi_wptr = v;
+    if (off == 0x0C) pi_base = v & ~0x1Fu;
+    else if (off == 0x10) pi_end = v & ~0x1Fu;
+    else if (off == 0x14) pi_wptr = v & ~0x1Fu;
 }
 
 uint32_t gx_cp_read(uint32_t off, int size) {
@@ -682,9 +719,12 @@ uint32_t gx_cp_read(uint32_t off, int size) {
         switch (o) {
         case 0x00:                                       // underflow, GP read idle, command idle
             return (uint16_t)(0x0E | (bp_reached() ? 0x10 : 0));
-        case 0x30: case 0x32: return 0;                  // read-write distance: empty
-        case 0x34: case 0x38: return (uint16_t)wp;       // write and read pointers
-        case 0x36: case 0x3A: return (uint16_t)(wp >> 16);
+        case 0x30: return (uint16_t)(held.size() * 32);  // read-write distance: what is held
+        case 0x32: return (uint16_t)(held.size() * 32 >> 16);
+        case 0x34: return (uint16_t)wp;                  // write pointer
+        case 0x36: return (uint16_t)(wp >> 16);
+        case 0x38: return (uint16_t)gp_rptr();           // read pointer
+        case 0x3A: return (uint16_t)(gp_rptr() >> 16);
         }
         return o / 2 < 0x40 ? cp_reg16[o / 2] : 0;
     };
@@ -699,7 +739,10 @@ void gx_cp_write(uint32_t off, uint32_t v, int size) {
         return;
     }
     if (off / 2 < 0x40) cp_reg16[off / 2] = (uint16_t)v;
-    if (off == 0x02) os_raise();
+    if (off == 0x02 || off == 0x3C || off == 0x3E) {    // control, the breakpoint: the GP may move on
+        if (!held.empty()) gp_run();
+        os_raise();
+    }
 }
 
 uint32_t gx_pe_read(uint32_t off, int) {

@@ -858,9 +858,12 @@ void ppc_mmio_write(uint32_t a, uint32_t v, int size) {
         }
         return;
     }
-    std::lock_guard<std::recursive_mutex> lk(g_hw);
-    if ((a & 0xFFFFF000u) != 0xCC008000u) log_access('W', a, size, v);
-    mmio_write(a, v, size);
+    {
+        std::lock_guard<std::recursive_mutex> lk(g_hw);
+        log_access('W', a, size, v);
+        mmio_write(a, v, size);
+    }
+    if ((a & 0xFFFFF000u) == 0xCC000000u) gx_submit_pending();   // the CP: the GP may have run on past a breakpoint
 }
 
 std::chrono::steady_clock::time_point ar_tick();

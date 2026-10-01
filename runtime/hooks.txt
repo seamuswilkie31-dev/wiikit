@@ -32,6 +32,8 @@ WPADRegisterAllocator
 WPADGetStatus
 WPADProbe
 WPADDisconnect
+WPADSetAutoSleepTime   # the Remote's sleep after minutes unused (SDKs of 2010 on)
+WPADResetAutoSleepTimeCount   # (chan): the channel's last use is now; on the control block
 WPADSetAutoSamplingBuf
 WPADGetLatestIndexInBuf
 WPADRead
@@ -61,6 +63,7 @@ WPADSetSpeakerVolume
 WPADGetSensorBarPosition
 WPADGetRadioSensitivity
 WPADGetInfoAsync
+WPADGetInfo            # WPADGetInfoAsync, then asleep until the Remote answers
 WPADSaveConfig
 KPADInit
 KPADInitEx             # KPADInit's body; games of 2010 call it directly

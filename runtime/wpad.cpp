@@ -281,6 +281,25 @@ void hle_WPADSetDataFormat(PPCContext& c) {
 // callback is called later, as the Remote answers.
 bool dpd_on[4] = {};
 
+// WPADInfo: dpd, speaker, attach, lowBat, nearempty (BOOLs), then battery
+// (0-4), led (a bit per LED), protocol, firmware: a Remote with full
+// batteries, its channel's LED lit, an extension attached in a game of the
+// Classic. False where no Remote is.
+bool fill_info(uint32_t chan, uint32_t info) {
+    if (!present(chan)) return false;
+    if (!info) return true;
+    st32(info + 0x00, dpd_on[chan]);
+    st32(info + 0x04, 0);
+    st32(info + 0x08, classic_game);
+    st32(info + 0x0C, 0);
+    st32(info + 0x10, 0);
+    st8(info + 0x14, 4);
+    st8(info + 0x15, (uint8_t)(1u << chan));
+    st8(info + 0x16, 0);
+    st8(info + 0x17, 0);
+    return true;
+}
+
 void hle_WPADControlDpd(PPCContext& c) {             // (chan, command: 0 off, else a mode, cb)
     uint32_t chan = c.r[3];
     if (!present(chan)) { ret(c, (uint32_t)WPAD_ERR_NO_CONTROLLER); return; }
@@ -326,7 +345,8 @@ void wpad_install() {
     auto no_controller = [](PPCContext& c) { c.r[3] = (uint32_t)WPAD_ERR_NO_CONTROLLER; };
     // set-up and state
     for (const char* n : {"WPADInit", "WPADRegisterAllocator", "WPADDisconnect", "WPADSetCallbackByKPAD", "WPADSetSpeakerVolume", "KPADInit", "KPADInitEx", "KPADReset",
-                          "KPADSetPosParam", "KPADSetAccParam", "KPADEnableDPD", "KPADDisableDPD"})
+                          "KPADSetPosParam", "KPADSetAccParam", "KPADEnableDPD", "KPADDisableDPD",
+                          "WPADSetAutoSleepTime", "WPADResetAutoSleepTimeCount"})   // no Remote to put to sleep
         ppc_hook(n, nop);
     ppc_hook("WPADGetStatus", [](PPCContext& c) { c.r[3] = WPAD_STATE_SETUP; });
     ppc_hook("WPADSaveConfig", [](PPCContext& c) { c.r[3] = 1; });
@@ -354,9 +374,20 @@ void wpad_install() {
                           "WPADCanSendStreamData", "WPADGetSensorBarPosition", "WPADGetRadioSensitivity",
                           "WPADStartFastSimpleSync", "WPADStopSimpleSync", "KPADIsEnableAimingMode"})
         ppc_hook(n, zero);
-    // anything addressed to a Remote's speaker or memory: there is none
-    for (const char* n : {"WPADControlSpeaker", "WPADSendStreamData", "WPADGetInfoAsync"})
+    // anything addressed to a Remote's speaker: there is none
+    for (const char* n : {"WPADControlSpeaker", "WPADSendStreamData"})
         ppc_hook(n, no_controller);
+    // the Remote's own report (battery, LEDs, what is attached), which a
+    // console asks the Remote for: WPADGetInfo waits for it asleep on the
+    // channel's control block, which a WPAD never started does not have
+    ppc_hook("WPADGetInfoAsync", [](PPCContext& c) {   // (chan, WPADInfo*, cb)
+        if (!fill_info(c.r[3], c.r[4])) { ret(c, (uint32_t)WPAD_ERR_NO_CONTROLLER); return; }
+        finish_later(c.r[5], c.r[3], WPAD_ERR_NONE);
+        ret(c, WPAD_ERR_NONE);
+    });
+    ppc_hook("WPADGetInfo", [](PPCContext& c) {        // (chan, WPADInfo*)
+        ret(c, fill_info(c.r[3], c.r[4]) ? WPAD_ERR_NONE : (uint32_t)WPAD_ERR_NO_CONTROLLER);
+    });
     ppc_hook("WPADProbe", hle_WPADProbe);
     ppc_hook("KPADRead", hle_KPADRead);
     ppc_hook("KPADReadEx", hle_KPADReadEx);
