@@ -12,6 +12,12 @@
 // the next. acc_speed, the change of acceleration between samples, is what
 // games compare with a threshold (Victorious: 0.4, over two frames).
 //
+// A game that plays with the Nunchuk (wpad_set_nunchuk) finds one on channel
+// 0's Remote: its stick and C and Z from video.cpp's PadState, held still
+// (gravity along -y), in KPAD's ex_status.fs and in WPAD's own samples as a
+// WPADFSStatus, and told by the connect and extension callbacks as the
+// Classic is.
+//
 // A game that plays with the Classic Controller (wpad_set_classic) finds one
 // on each channel that has a Classic from video.cpp (video_classic: channel 0
 // the keyboard and the first pad, the others the pads plugged in), in the
@@ -40,10 +46,11 @@ namespace {
 
 constexpr uint32_t WPAD_STATE_SETUP = 3;
 constexpr int32_t WPAD_ERR_NONE = 0, WPAD_ERR_NO_CONTROLLER = -1;
-constexpr uint32_t WPAD_DEV_CORE = 0, WPAD_DEV_CLASSIC = 2, WPAD_DEV_NOT_FOUND = 253;
-constexpr uint8_t WPAD_FMT_CORE_ACC_DPD = 2, WPAD_FMT_CLASSIC_ACC_DPD = 8;
+constexpr uint32_t WPAD_DEV_CORE = 0, WPAD_DEV_FREESTYLE = 1, WPAD_DEV_CLASSIC = 2, WPAD_DEV_NOT_FOUND = 253;
+constexpr uint8_t WPAD_FMT_CORE_ACC_DPD = 2, WPAD_FMT_FREESTYLE_ACC_DPD = 5, WPAD_FMT_CLASSIC_ACC_DPD = 8;
 uint32_t kpad_status_size = 0xF0;                   // the SDK's KPADStatus: 0xF0 in later SDKs, 0x84 in 2006-07's
 bool classic_game = false;
+bool nunchuk_game = false;                          // a Nunchuk on channel 0's Remote
 WpadClassicFilter classic_filter = nullptr;
 bool motor_enabled = true;                          // SYSCONF's BT.MOT: rumble on, as a console ships
 
@@ -53,6 +60,14 @@ void stf(uint32_t a, float f) { uint32_t u; std::memcpy(&u, &f, 4); st32(a, u); 
 // ---- what each channel holds ------------------------------------------------------------------
 // A Remote on channel 0 always; with the Classic, a Remote holding one
 // wherever video.cpp has a Classic Controller.
+// What a present channel's Remote holds.
+uint32_t device(uint32_t chan) {
+    return classic_game ? WPAD_DEV_CLASSIC : nunchuk_game && chan == 0 ? WPAD_DEV_FREESTYLE : WPAD_DEV_CORE;
+}
+uint8_t format(uint32_t dev) {
+    return dev == WPAD_DEV_CLASSIC ? WPAD_FMT_CLASSIC_ACC_DPD : dev == WPAD_DEV_FREESTYLE ? WPAD_FMT_FREESTYLE_ACC_DPD : WPAD_FMT_CORE_ACC_DPD;
+}
+
 bool present(uint32_t chan) {
     if (chan >= 4) return false;
     if (!classic_game) return chan == 0;
@@ -92,7 +107,7 @@ void deliver(const PPCContext& c) {
     delivering = true;
     for (int i = 0; i < ndone; ++i) call(c, done[i].cb, done[i].chan, (uint32_t)done[i].result);
     ndone = 0;
-    if (!classic_game) { delivering = false; return; }
+    if (!classic_game && !nunchuk_game) { delivering = false; return; }
     uint64_t now = os_tb_now();
     for (uint32_t i = 0; i < 4; ++i) {
         Channel& ch = chans[i];
@@ -104,12 +119,13 @@ void deliver(const PPCContext& c) {
         ch.told = true;
         ch.told_present = here;
         int32_t reason = here ? WPAD_ERR_NONE : WPAD_ERR_NO_CONTROLLER;
-        rt_log("wpad: channel %u %s", i + 1, here ? "connected, a Classic Controller attached" : "disconnected");
+        rt_log("wpad: channel %u %s", i + 1, !here ? "disconnected" : device(i) == WPAD_DEV_CLASSIC ? "connected, a Classic Controller attached"
+                                              : device(i) == WPAD_DEV_FREESTYLE ? "connected, a Nunchuk attached" : "connected");
         if (ch.wpad_connect_cb) call(c, ch.wpad_connect_cb, i, (uint32_t)reason);
         if (ch.kpad_connect_cb) call(c, ch.kpad_connect_cb, i, (uint32_t)reason);
         // the extension, as the Remote reports it after connecting (the
         // callback may have been registered by the connect callback)
-        if (here && ch.extension_cb) call(c, ch.extension_cb, i, WPAD_DEV_CLASSIC);
+        if (here && ch.extension_cb && device(i) != WPAD_DEV_CORE) call(c, ch.extension_cb, i, device(i));
     }
     delivering = false;
 }
@@ -131,7 +147,7 @@ void hle_WPADProbe(PPCContext& c) {                  // (chan, u32* type)
     deliver(c);
     uint32_t chan = c.r[3];
     bool here = present(chan);
-    if (c.r[4]) st32(c.r[4], !here ? WPAD_DEV_NOT_FOUND : classic_game ? WPAD_DEV_CLASSIC : WPAD_DEV_CORE);
+    if (c.r[4]) st32(c.r[4], !here ? WPAD_DEV_NOT_FOUND : device(chan));
     ret(c, here ? 0 : (uint32_t)WPAD_ERR_NO_CONTROLLER);
 }
 
@@ -176,10 +192,17 @@ void hle_KPADRead(PPCContext& c) {
     stf(s + 0x48, 2.0f);                              // dist: two metres from the sensor bar
     stf(s + 0x54, acc[0]);                            // acc_vertical
     stf(s + 0x58, acc[1]);
-    st8(s + 0x5C, classic_game ? WPAD_DEV_CLASSIC : WPAD_DEV_CORE);   // dev_type
+    uint32_t dev = device(chan);
+    st8(s + 0x5C, (uint8_t)dev);                      // dev_type
     st8(s + 0x5D, 0);                                 // wpad_err: none
     st8(s + 0x5E, p.pointer ? 2 : 0);                 // dpd_valid_fg: both sensor-bar points seen
-    st8(s + 0x5F, classic_game ? WPAD_FMT_CLASSIC_ACC_DPD : WPAD_FMT_CORE_ACC_DPD);   // data_format
+    st8(s + 0x5F, format(dev));                       // data_format
+    if (dev == WPAD_DEV_FREESTYLE) {                  // ex_status.fs: the stick, the Nunchuk held still
+        stf(s + 0x60, p.sx);
+        stf(s + 0x64, p.sy);
+        stf(s + 0x6C, -1.0f);                         // acc: gravity along -y
+        stf(s + 0x74, 1.0f);                          // acc_value; acc_speed 0
+    }
     if (classic_game) {                               // ex_status.cl
         ClassicState k = video_classic((int)chan);
         if (classic_filter) classic_filter((int)chan, k);
@@ -214,6 +237,7 @@ void hle_KPADGetSensorHeight(PPCContext& c) { c.f[1] = c.ps1[1] = 0.0; }
 // caller's ring of 16. Here the newest sample is always at index 0, written
 // when read.
 constexpr uint32_t kStatusSize[3] = {0x2A, 0x32, 0x36};   // by device: core, Nunchuk, Classic
+constexpr int16_t kFsAcc1g = 200;                         // the Nunchuk's 1 g in WPAD's counts, about (its zero at 512)
 
 struct Ring { uint32_t buf = 0, len = 0; };
 Ring rings[4];
@@ -232,16 +256,24 @@ uint8_t trigger(float t) { return t > 0 ? (uint8_t)std::lround(30.0f + 150.0f * 
 // point seen, its buttons the host's on channel 0 unless it holds a Classic.
 uint32_t write_status(uint32_t chan, uint32_t s) {
     bool here = present(chan);
-    uint32_t dev = !here ? WPAD_DEV_NOT_FOUND : classic_game ? WPAD_DEV_CLASSIC : WPAD_DEV_CORE;
-    uint32_t size = kStatusSize[dev == WPAD_DEV_CLASSIC ? 2 : 0];
+    uint32_t dev = !here ? WPAD_DEV_NOT_FOUND : device(chan);
+    uint32_t size = kStatusSize[dev == WPAD_DEV_CLASSIC ? 2 : dev == WPAD_DEV_FREESTYLE ? 1 : 0];
     for (uint32_t i = 0; i < size; i += 2) st16(s + i, 0);
     if (!here) {
         st8(s + 0x28, (uint8_t)dev);
         st8(s + 0x29, (uint8_t)WPAD_ERR_NO_CONTROLLER);
         return dev;
     }
-    if (chan == 0 && !classic_game) st16(s + 0x00, (uint16_t)video_pad().buttons);
+    PadState p = chan == 0 && !classic_game ? video_pad() : PadState{};
+    if (chan == 0 && !classic_game) st16(s + 0x00, (uint16_t)p.buttons);
     st8(s + 0x28, (uint8_t)dev);                      // dev, err: none
+    if (dev == WPAD_DEV_FREESTYLE) {                  // fsAccX, Y, Z (s16), fsStickX, Y (s8): held still
+        st16(s + 0x2A, 512);
+        st16(s + 0x2C, (uint16_t)(512 - kFsAcc1g));
+        st16(s + 0x2E, 512);
+        st8(s + 0x30, (uint8_t)(int8_t)std::lround(p.sx * 100.0f));
+        st8(s + 0x31, (uint8_t)(int8_t)std::lround(p.sy * 100.0f));
+    }
     if (dev == WPAD_DEV_CLASSIC) {
         ClassicState k = video_classic((int)chan);
         if (classic_filter) classic_filter((int)chan, k);
@@ -268,7 +300,7 @@ int32_t formats[4] = {-1, -1, -1, -1};
 void hle_WPADGetDataFormat(PPCContext& c) {
     uint32_t chan = c.r[3];
     int32_t f = chan < 4 ? formats[chan] : -1;
-    ret(c, f >= 0 ? (uint32_t)f : classic_game ? WPAD_FMT_CLASSIC_ACC_DPD : WPAD_FMT_CORE_ACC_DPD);
+    ret(c, f >= 0 ? (uint32_t)f : format(device(chan)));
 }
 
 void hle_WPADSetDataFormat(PPCContext& c) {
@@ -290,7 +322,7 @@ bool fill_info(uint32_t chan, uint32_t info) {
     if (!info) return true;
     st32(info + 0x00, dpd_on[chan]);
     st32(info + 0x04, 0);
-    st32(info + 0x08, classic_game);
+    st32(info + 0x08, device(chan) != WPAD_DEV_CORE);
     st32(info + 0x0C, 0);
     st32(info + 0x10, 0);
     st8(info + 0x14, 4);
@@ -325,7 +357,7 @@ void hle_kpad_wpad_status(PPCContext& c) {
     deliver(c);
     uint32_t chan = c.r[3], buf = c.r[4], want = c.r[5];
     if (chan < 4 && buf && want < 3) {
-        uint32_t dev = present(chan) ? (classic_game ? WPAD_DEV_CLASSIC : WPAD_DEV_CORE) : WPAD_DEV_NOT_FOUND;
+        uint32_t dev = present(chan) ? device(chan) : WPAD_DEV_NOT_FOUND;
         if (dev == want)
             for (uint32_t i = 0; i < 16; ++i) write_status(chan, buf + i * kStatusSize[want]);
     }
@@ -336,6 +368,7 @@ void hle_kpad_wpad_status(PPCContext& c) {
 
 void wpad_set_kpad_status_size(uint32_t size) { kpad_status_size = size; }
 void wpad_set_classic(bool on) { classic_game = on; }
+void wpad_set_nunchuk(bool on) { nunchuk_game = on; }
 void wpad_set_classic_filter(WpadClassicFilter f) { classic_filter = f; }
 void wpad_filter_classic(int chan, ClassicState& s) { if (classic_filter) classic_filter(chan, s); }
 

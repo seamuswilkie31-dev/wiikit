@@ -40,6 +40,10 @@
     X(PFNGLLINKPROGRAMPROC, glLinkProgram)                                                          \
     X(PFNGLGETPROGRAMIVPROC, glGetProgramiv)                                                        \
     X(PFNGLGETPROGRAMINFOLOGPROC, glGetProgramInfoLog)                                              \
+    X(PFNGLPROGRAMPARAMETERIPROC, glProgramParameteri)                                              \
+    X(PFNGLDELETEPROGRAMPROC, glDeleteProgram)                                                      \
+    X(PFNGLGETPROGRAMBINARYPROC, glGetProgramBinary)                                                \
+    X(PFNGLPROGRAMBINARYPROC, glProgramBinary)                                                      \
     X(PFNGLUSEPROGRAMPROC, glUseProgram)                                                            \
     X(PFNGLGETUNIFORMLOCATIONPROC, glGetUniformLocation)                                            \
     X(PFNGLPROGRAMUNIFORM1IPROC, glProgramUniform1i)                                                \

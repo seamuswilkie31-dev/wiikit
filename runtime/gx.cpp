@@ -48,7 +48,7 @@ std::vector<uint8_t> stream;                       // bytes not yet parsed
 bool desync = false;
 std::vector<uint8_t> tmem(1 << 20);                // texture memory: only palettes are loaded here
 
-struct Stats { uint64_t cmds, draws, verts, dls, copies, frames, done, uploads; } st;
+struct Stats { uint64_t cmds, draws, verts, dls, copies, frames, done, uploads, peeks, readbacks; } st;
 
 // WIIKIT_GXTRACE=N: every command of frame N (counted in XFB copies) to
 // gxtrace_N.txt; F12 in the window asks for the next frame the same way
@@ -637,7 +637,9 @@ uint32_t gx_efb_peek(uint32_t a) {
     static std::vector<uint32_t> argb, z;
     static uint64_t at = UINT64_MAX;
     std::lock_guard<std::mutex> lk(mx);
+    ++st.peeks;
     if (at != rec_total) {
+        ++st.readbacks;
         hw_run_locked([] { if (!rec.empty()) submit_pending = true; });
         gx_submit_pending();
         if (!video_efb_read(argb, z)) return 0;
@@ -854,8 +856,9 @@ uint32_t gx_irq() {
 
 void gx_report() {
     rt_log("gx: %llu commands, %llu draws (%llu vertices), %llu display lists, %llu EFB copies "
-           "(%llu frames), %llu draw-done, %llu texture uploads",
+           "(%llu frames), %llu draw-done, %llu texture uploads, %llu EFB peeks (%llu read-backs)",
            (unsigned long long)st.cmds, (unsigned long long)st.draws, (unsigned long long)st.verts,
            (unsigned long long)st.dls, (unsigned long long)st.copies, (unsigned long long)st.frames,
-           (unsigned long long)st.done, (unsigned long long)st.uploads);
+           (unsigned long long)st.done, (unsigned long long)st.uploads, (unsigned long long)st.peeks,
+           (unsigned long long)st.readbacks);
 }

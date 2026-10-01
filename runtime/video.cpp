@@ -26,6 +26,7 @@
 #include <condition_variable>
 #include <cstring>
 #include <deque>
+#include <filesystem>
 #include <mutex>
 #include <string>
 #include <unordered_map>
@@ -102,9 +103,13 @@ std::unordered_map<uint32_t, Tex> efb_copies;      // EFB copies to texture, by 
 std::unordered_map<uint32_t, Tex> xfbs;            // EFB copies to the XFB, by address
 uint64_t map_src[8];                               // per map: texture id, or 1 << 32 | EFB copy address
 uint32_t last_xfb = 0;
-std::unordered_map<std::string, GLuint> programs;
+std::unordered_map<std::string, GLuint> programs;       // by the registers that shape the code (gx_shader_key)
+// by the code itself: registers a game rewrites with bits the generator
+// ignores give new keys for the same code, and a link costs milliseconds
+// (Crystal Bearers: 1 160 keys for 396 programs in its title's first minute)
+std::unordered_map<std::string, GLuint> programs_by_source;
 
-struct Counters { uint64_t frames, presents, draws, programs; } cnt;
+struct Counters { uint64_t frames, presents, draws, programs, linked, cached; } cnt;
 bool dump_ps = false;                              // WIIKIT_SHADERDUMP: log the next uniforms
 
 int32_t s11(uint32_t v) { return (int32_t)((v & 0x7FF) << 21) >> 21; }
@@ -145,6 +150,7 @@ GLuint link(const std::string& vs, const std::string& fs) {
     GLuint p = glCreateProgram();
     glAttachShader(p, v);
     glAttachShader(p, f);
+    glProgramParameteri(p, GL_PROGRAM_BINARY_RETRIEVABLE_HINT, GL_TRUE);   // for the shader cache
     glLinkProgram(p);
     glDeleteShader(v);
     glDeleteShader(f);
@@ -157,6 +163,64 @@ GLuint link(const std::string& vs, const std::string& fs) {
         return 0;
     }
     return p;
+}
+
+// The shader cache: each program linked is kept on disk as the driver's
+// binary (VideoOptions::shader_cache, EXTRACT_DIR/../shadercache), named by
+// a hash of its source and of the driver. The next time the game asks for
+// it, it loads in microseconds where a link takes milliseconds: a scene seen
+// once no longer stutters the first time it is drawn again. A driver that
+// changed gives other names; one that refuses a binary gets the program
+// linked anew.
+uint64_t source_hash(const std::string& source) {
+    static const std::string driver = std::string((const char*)glGetString(GL_RENDERER)) + '\0' +
+                                      (const char*)glGetString(GL_VERSION) + '\0';
+    uint64_t h = 0xCBF29CE484222325ull;                                  // FNV-1a
+    for (const std::string* s : {&driver, &source})
+        for (unsigned char ch : *s) h = (h ^ ch) * 0x100000001B3ull;
+    return h;
+}
+
+std::string cache_path(uint64_t hash) {
+    char name[32];
+    std::snprintf(name, sizeof name, "/%016llx.bin", (unsigned long long)hash);
+    return opt.shader_cache + name;
+}
+
+GLuint load_program(uint64_t hash) {
+    if (opt.shader_cache.empty()) return 0;
+    FILE* f = std::fopen(cache_path(hash).c_str(), "rb");
+    if (!f) return 0;
+    std::vector<uint8_t> data;
+    uint8_t buf[65536];
+    for (size_t n; (n = std::fread(buf, 1, sizeof buf, f)) > 0;) data.insert(data.end(), buf, buf + n);
+    std::fclose(f);
+    if (data.size() <= 4) return 0;
+    GLenum format;
+    std::memcpy(&format, data.data(), 4);
+    GLuint p = glCreateProgram();
+    glProgramBinary(p, format, data.data() + 4, (GLsizei)(data.size() - 4));
+    GLint ok = 0;
+    glGetProgramiv(p, GL_LINK_STATUS, &ok);
+    if (!ok) { glDeleteProgram(p); return 0; }
+    return p;
+}
+
+void save_program(GLuint p, uint64_t hash) {
+    if (opt.shader_cache.empty()) return;
+    static bool made = false;
+    if (!made) { made = true; std::error_code ec; std::filesystem::create_directories(opt.shader_cache, ec); }
+    GLint len = 0;
+    glGetProgramiv(p, GL_PROGRAM_BINARY_LENGTH, &len);
+    if (len <= 0) return;
+    std::vector<uint8_t> data(4 + (size_t)len);
+    GLenum format = 0;
+    glGetProgramBinary(p, len, nullptr, &format, data.data() + 4);
+    std::memcpy(data.data(), &format, 4);
+    if (FILE* f = std::fopen(cache_path(hash).c_str(), "wb")) {
+        std::fwrite(data.data(), 1, data.size(), f);
+        std::fclose(f);
+    }
 }
 
 void ensure_tex(Tex& t, int w, int h, int levels) {
@@ -326,7 +390,16 @@ GLuint program_for(uint8_t vflags) {
     if (it != programs.end()) return it->second;
     std::string vs, fs;
     gx_shader_gen(bp, xf, vflags, vs, fs);
-    GLuint p = link(vs, fs);
+    std::string source = vs + '\0' + fs;
+    if (auto same = programs_by_source.find(source); same != programs_by_source.end()) {
+        programs.emplace(std::move(key), same->second);
+        return same->second;
+    }
+    uint64_t hash = source_hash(source);
+    GLuint p = load_program(hash);
+    if (p) ++cnt.cached;
+    else if ((p = link(vs, fs))) { ++cnt.linked; save_program(p, hash); }
+    programs_by_source.emplace(std::move(source), p);
     if (const char* dir = std::getenv("WIIKIT_SHADERDUMP")) {           // debugging: the sources
         std::string path = std::string(dir) + "/prog_" + std::to_string(cnt.programs) + ".glsl";
         if (FILE* f = std::fopen(path.c_str(), "w")) {
@@ -760,6 +833,7 @@ Rect picture_rect(float w, float h) {
 struct Binding { SDL_Scancode key; uint32_t mouse; uint32_t bits; bool shake; bool drag; bool classic; };
 // not Remote buttons: the Remote raised, pointing up (PadState::tilt)
 constexpr uint32_t kRaisePlus = 1u << 24, kRaiseMinus = 1u << 25;
+constexpr uint32_t kWalk = 1u << 26;                // the Nunchuk's stick at half its travel
 // the Classic's buttons (KPAD_CL_*), and its sticks pushed to the full by a key
 enum : uint32_t { CL_UP = 0x0001, CL_LEFT = 0x0002, CL_ZR = 0x0004, CL_X = 0x0008, CL_A = 0x0010,
                   CL_Y = 0x0020, CL_B = 0x0040, CL_ZL = 0x0080, CL_R = 0x0200, CL_PLUS = 0x0400,
@@ -838,7 +912,10 @@ bool parse_keys(const std::string& text, const std::string& path, bool remote, b
     static const Btn buttons[] = {{"A", 0x0800}, {"B", 0x0400}, {"Up", 0x0008}, {"Down", 0x0004},
                                   {"Left", 0x0001}, {"Right", 0x0002}, {"Plus", 0x0010}, {"Minus", 0x1000},
                                   {"1", 0x0200}, {"2", 0x0100}, {"Shake", 0},
-                                  {"Raise", kRaisePlus}, {"Raise Alt", kRaiseMinus}};
+                                  {"Raise", kRaisePlus}, {"Raise Alt", kRaiseMinus},
+                                  {"C", 0x4000}, {"Z", 0x2000},                  // the Nunchuk's
+                                  {"Stick Up", kStick << 0}, {"Stick Down", kStick << 1},
+                                  {"Stick Left", kStick << 2}, {"Stick Right", kStick << 3}, {"Walk", kWalk}};
     static const Btn cl_buttons[] = {{"A", CL_A}, {"B", CL_B}, {"X", CL_X}, {"Y", CL_Y}, {"L", CL_L}, {"R", CL_R},
                                      {"ZL", CL_ZL}, {"ZR", CL_ZR}, {"Plus", CL_PLUS}, {"Minus", CL_MINUS},
                                      {"Home", CL_HOME}, {"Up", CL_UP}, {"Down", CL_DOWN}, {"Left", CL_LEFT},
@@ -904,7 +981,8 @@ bool parse_keys(const std::string& text, const std::string& path, bool remote, b
         if (!b) {
             if (in_classic) rt_log("video: %s:%d: not a Classic Controller button (A B X Y L R ZL ZR Plus Minus Home Up Down Left Right, "
                                    "Left Stick Up..., Right Stick Up...) or setting (Input, Face Buttons, Dead Zone)", path.c_str(), line);
-            else rt_log("video: %s:%d: not a Remote button (A B Up Down Left Right Plus Minus 1 2 Shake Raise)", path.c_str(), line);
+            else rt_log("video: %s:%d: not a Remote button (A B Up Down Left Right Plus Minus 1 2 Shake Raise; the Nunchuk's "
+                        "C Z Stick Up/Down/Left/Right Walk)", path.c_str(), line);
             continue;
         }
         for (size_t p = 0; p <= rest.size();) {
@@ -1097,7 +1175,15 @@ void update_pad() {
         if (k.bits & kRaisePlus) p.tilt = 1;
         if (k.bits & kRaiseMinus) p.tilt = -1;
     }
-    p.buttons &= ~(kRaisePlus | kRaiseMinus);
+    // the Nunchuk's stick from keys (kStick << 0..3 are free among the Remote's bits)
+    {
+        auto dir = [&](int i) { return p.buttons & (kStick << i) ? 1.0f : 0.0f; };
+        p.sx = dir(3) - dir(2);
+        p.sy = dir(0) - dir(1);
+        if (p.sx && p.sy) { p.sx *= 0.7071f; p.sy *= 0.7071f; }
+        if (p.buttons & kWalk) { p.sx *= 0.5f; p.sy *= 0.5f; }
+    }
+    p.buttons &= ~(kRaisePlus | kRaiseMinus | kWalk | (kStick * 0xF));
     int ww = 0, wh = 0;
     SDL_GetWindowSize(win, &ww, &wh);                        // mouse coordinates are in window units
     if (ww > 0 && wh > 0 && (SDL_GetWindowFlags(win) & SDL_WINDOW_MOUSE_FOCUS)) {
@@ -1476,9 +1562,10 @@ void video_run(const char* title) {
         auto now = Clock::now();
         if (opt.quit_after > 0 && std::chrono::duration<double>(now - t0).count() > opt.quit_after) quit = true;
         if (quit) {
-            rt_log("video: %llu frames, %llu presents, %llu draws, %llu programs",
+            rt_log("video: %llu frames, %llu presents, %llu draws, %llu programs (%llu linked, %llu from the shader cache)",
                    (unsigned long long)cnt.frames, (unsigned long long)cnt.presents,
-                   (unsigned long long)cnt.draws, (unsigned long long)cnt.programs);
+                   (unsigned long long)cnt.draws, (unsigned long long)cnt.programs,
+                   (unsigned long long)cnt.linked, (unsigned long long)cnt.cached);
             gx_report();
             std::fflush(stdout);
             std::_Exit(0);

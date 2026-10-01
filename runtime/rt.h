@@ -100,6 +100,8 @@ void wpad_set_kpad_status_size(uint32_t size);
 struct ClassicState;
 using WpadClassicFilter = void (*)(int chan, ClassicState& s);
 void wpad_set_classic(bool on);
+// A game that plays with the Remote and the Nunchuk: one on channel 0.
+void wpad_set_nunchuk(bool on);
 void wpad_set_classic_filter(WpadClassicFilter f);
 void wpad_filter_classic(int chan, ClassicState& s);  // the port's filter, if it has one
 

@@ -66,6 +66,7 @@ struct VideoOptions {
     bool fullscreen = false;                 // start fullscreen (borderless, at the desktop's mode)
     int window_w = 0, window_h = 0;          // the window's size; 0 = 720 lines at the screen's shape
     std::string keys;                        // the key file: the Remote's buttons on keys and mouse buttons
+    std::string shader_cache;                // a directory for linked programs' binaries; empty = none
     int input = -1;                          // channel 1's sources, INPUT_MODE_* (windows.h has INPUT_*); -1: the key file's
 };
 enum { INPUT_MODE_AUTO, INPUT_MODE_PAD, INPUT_MODE_KEYBOARD };
@@ -75,7 +76,9 @@ void video_configure(const VideoOptions& o);
 // mouse is inside it; shake while the Remote is to be shaken.
 // tilt: 0 level, pointing at the screen; +1 or -1 raised, pointing up (the
 // sign of KPAD's acc.z then, while a game's expectation is found out)
-struct PadState { uint32_t buttons = 0; float x = 0, y = 0; bool pointer = false, shake = false; int tilt = 0; };
+// The Nunchuk (for a game that plays with one: wpad_set_nunchuk): C and Z in
+// buttons (KPAD's 0x4000, 0x2000), its stick sx, sy (-1..1, y up).
+struct PadState { uint32_t buttons = 0; float x = 0, y = 0; bool pointer = false, shake = false; int tilt = 0; float sx = 0, sy = 0; };
 PadState video_pad();
 // A Classic Controller on each of the four channels (for a game that plays
 // with one: wpad_set_classic). Gamepads (SDL's: XInput, DualShock and
