@@ -87,6 +87,17 @@ std::vector<Burst> held;
 uint32_t pi_wptr_addr() { return pi_wptr & 0x1FFFFFFFu; }
 uint32_t gp_rptr() { return held.empty() ? pi_wptr_addr() : held.front().addr; }
 bool bp_reached() { return bp_enabled() && gp_rptr() == bp_addr(); }
+// The FIFO's watermarks (CP 0x28/0x2A high, 0x2C/0x2E low): while the GP is
+// held, the CPU fills the FIFO; past the high one the CP raises its overflow
+// interrupt and the SDK suspends the writing thread (GXSetCurrentGXThread's)
+// until the GP has drained it below the low one, the underflow interrupt.
+// Without them the CPU would write over what the GP has not read, and a
+// breakpoint's address would come round again in what is held.
+uint32_t held_bytes() { return (uint32_t)held.size() * 32; }
+uint32_t cp_hiwater() { return (uint32_t)(cp_reg16[0x15] & 0x3FFF) << 16 | cp_reg16[0x14]; }
+uint32_t cp_lowater() { return (uint32_t)(cp_reg16[0x17] & 0x3FFF) << 16 | cp_reg16[0x16]; }
+bool cp_overflow() { return cp_hiwater() && held_bytes() > cp_hiwater(); }
+bool cp_underflow() { return held_bytes() < cp_lowater(); }
 
 uint32_t be32(const uint8_t* p) { return (uint32_t)p[0] << 24 | p[1] << 16 | p[2] << 8 | p[3]; }
 uint16_t be16(const uint8_t* p) { return (uint16_t)(p[0] << 8 | p[1]); }
@@ -164,7 +175,7 @@ uint32_t tex_next_id = 1, tex_gen = 1;
 uint8_t tex_dirty = 0xFF;                          // maps whose binding must be looked at again
 uint64_t map_bound[8];                             // what the renderer has on each map
 
-struct CopyRec { size_t size; uint64_t hash; };
+struct CopyRec { size_t size; uint64_t hash; uint32_t fmt; int w, h; };
 std::unordered_map<uint32_t, CopyRec> copies;      // EFB copies to texture, by address
 
 // texture format an EFB copy format produces in RAM (for its size)
@@ -434,7 +445,7 @@ void efb_copy(uint32_t v) {
     if (v >> 9 & 1) { w = (w + 1) / 2; h = (h + 1) / 2; }
     uint32_t tpf = v >> 3 & 15, real = tpf / 2 + (tpf & 1) * 8;
     size_t size = gxtex_size(copy_tex_fmt(real), w, h);
-    if (mem_ok(dest, size)) copies[dest] = CopyRec{size, hash_mem(host(virt(dest)), size)};
+    if (mem_ok(dest, size)) copies[dest] = CopyRec{size, hash_mem(host(virt(dest)), size), copy_tex_fmt(real), w, h};
     tex_dirty = 0xFF;
 }
 
@@ -637,6 +648,75 @@ uint32_t gx_efb_peek(uint32_t a) {
     return (a & 0x400000u ? z : argb)[y * 640 + x];
 }
 
+// An EFB copy's pixels in RAM, in its texture format (GX's tiles), from the
+// renderer's copy (RGBA as a texture unit reads it: the intensity formats
+// in R, their alpha in A). The renderer keeps copies on the host GPU and
+// leaves RAM alone; a game that reads a copy on the CPU (to compress it, to
+// save it) gets its bytes when the port asks, where the game reads them.
+static void encode_tex(uint32_t fmt, int w, int h, const uint8_t* rgba, uint8_t* out) {
+    static const int bw[] = {8, 8, 8, 4, 4, 4, 4}, bh[] = {8, 4, 4, 4, 4, 4, 4};
+    int tw = bw[fmt], th = bh[fmt];
+    auto px = [&](int x, int y) -> const uint8_t* {
+        static const uint8_t none[4] = {0, 0, 0, 0};
+        return x < w && y < h ? rgba + ((size_t)y * w + x) * 4 : none;
+    };
+    uint8_t* o = out;
+    for (int by = 0; by < h; by += th)
+        for (int bx = 0; bx < w; bx += tw) {
+            if (fmt == 6) {                                  // RGBA8: AR pairs, then GB pairs
+                for (int i = 0; i < 16; ++i) { const uint8_t* c = px(bx + i % 4, by + i / 4); o[2 * i] = c[3]; o[2 * i + 1] = c[0]; }
+                for (int i = 0; i < 16; ++i) { const uint8_t* c = px(bx + i % 4, by + i / 4); o[32 + 2 * i] = c[1]; o[33 + 2 * i] = c[2]; }
+                o += 64;
+                continue;
+            }
+            for (int y = 0; y < th; ++y)
+                for (int x = 0; x < tw; ++x) {
+                    const uint8_t* c = px(bx + x, by + y);
+                    switch (fmt) {
+                    case 0:                                  // I4
+                        if (x & 1) *o++ |= c[0] >> 4; else *o = (uint8_t)(c[0] & 0xF0);
+                        break;
+                    case 1: *o++ = c[0]; break;              // I8
+                    case 2: *o++ = (uint8_t)((c[3] & 0xF0) | c[0] >> 4); break;   // IA4
+                    case 3: *o++ = c[3]; *o++ = c[0]; break; // IA8
+                    case 4: {                                // RGB565
+                        uint16_t v = (uint16_t)((c[0] >> 3) << 11 | (c[1] >> 2) << 5 | c[2] >> 3);
+                        *o++ = (uint8_t)(v >> 8); *o++ = (uint8_t)v;
+                        break;
+                    }
+                    case 5: {                                // RGB5A3
+                        uint16_t v = c[3] >= 0xE0 ? (uint16_t)(0x8000 | (c[0] >> 3) << 10 | (c[1] >> 3) << 5 | c[2] >> 3)
+                                                  : (uint16_t)((c[3] >> 5) << 12 | (c[0] >> 4) << 8 | (c[1] >> 4) << 4 | c[2] >> 4);
+                        *o++ = (uint8_t)(v >> 8); *o++ = (uint8_t)v;
+                        break;
+                    }
+                    }
+                }
+        }
+}
+
+bool gx_copy_to_ram(uint32_t addr) {
+    CopyRec rec_copy;
+    bool known = false;
+    hw_run_locked([&] {
+        auto c = copies.find(addr);
+        if (c != copies.end()) { rec_copy = c->second; known = true; }
+        if (!rec.empty()) submit_pending = true;
+    });
+    if (!known || rec_copy.fmt > 6) return false;
+    gx_submit_pending();
+    std::vector<uint8_t> rgba;
+    if (!video_copy_read(addr, rec_copy.w, rec_copy.h, rgba)) return false;
+    std::vector<uint8_t> out(rec_copy.size);
+    encode_tex(rec_copy.fmt, rec_copy.w, rec_copy.h, rgba.data(), out.data());
+    hw_run_locked([&] {
+        std::memcpy(host(virt(addr)), out.data(), out.size());
+        auto c = copies.find(addr);                          // the GPU's copy still stands for these bytes
+        if (c != copies.end()) c->second.hash = hash_mem(host(virt(addr)), c->second.size);
+    });
+    return true;
+}
+
 void gx_init() {
     video = video_enabled();
     g_efb_peek = gx_efb_peek;
@@ -698,7 +778,11 @@ void gx_pipe_burst(const uint8_t* b, int n) {
     Burst h{at, {}};
     std::memcpy(h.b, b, 32);
     held.push_back(h);
-    if (bp_reached()) os_raise();                  // the GP has come to the breakpoint
+    if (cp_overflow()) {
+        static bool told = false;
+        if (!told) { told = true; rt_log("gx: the FIFO filled up behind a breakpoint (%u bytes held): the writer waits", held_bytes()); }
+    }
+    if (bp_reached() || cp_overflow()) os_raise();   // the GP has come to the breakpoint, or the FIFO is full
 }
 
 uint32_t gx_pi_fifo_read(uint32_t off) {
@@ -717,8 +801,8 @@ uint32_t gx_cp_read(uint32_t off, int size) {
     auto r16 = [](uint32_t o) -> uint16_t {
         uint32_t wp = pi_wptr & PI_ADDR;
         switch (o) {
-        case 0x00:                                       // underflow, GP read idle, command idle
-            return (uint16_t)(0x0E | (bp_reached() ? 0x10 : 0));
+        case 0x00:                                       // overflow, underflow, GP read idle, command idle, breakpoint
+            return (uint16_t)((cp_overflow() ? 1 : 0) | (cp_underflow() ? 2 : 0) | 0x0C | (bp_reached() ? 0x10 : 0));
         case 0x30: return (uint16_t)(held.size() * 32);  // read-write distance: what is held
         case 0x32: return (uint16_t)(held.size() * 32 >> 16);
         case 0x34: return (uint16_t)wp;                  // write pointer
@@ -763,6 +847,8 @@ uint32_t gx_irq() {
     if ((pe_ctrl & 4) && (pe_ctrl & 1)) c |= 0x200;      // PE token
     if ((pe_ctrl & 8) && (pe_ctrl & 2)) c |= 0x400;      // PE finish
     if (bp_reached() && (cp_reg16[1] & 0x20)) c |= 0x800;   // CP breakpoint
+    if ((cp_reg16[1] & 0x04) && cp_overflow()) c |= 0x800;   // CP overflow: the FIFO is full
+    if ((cp_reg16[1] & 0x08) && cp_underflow()) c |= 0x800;  // CP underflow: drained again
     return c;
 }
 

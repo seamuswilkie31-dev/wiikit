@@ -4,6 +4,7 @@
 #include <chrono>
 #include <cstdarg>
 #include <cstdio>
+#include <functional>
 #include <string>
 
 // ---- core.cpp ---------------------------------------------------------------------------
@@ -69,8 +70,12 @@ void gx_init();                                   // after video_configure
 void gx_report();                                 // command stream statistics
 void gx_trace_next_frame();                       // the next frame's commands to gxtrace_N.txt (F12)
 void gx_submit_pending();                         // after a burst, outside g_hw: hand the record to the renderer
+// An EFB copy to texture, written into RAM in its texture format: for a
+// game that reads the copy on the CPU (the renderer otherwise keeps copies
+// on the host GPU only). False if no copy was made to addr (physical).
+bool gx_copy_to_ram(uint32_t addr);
 void gx_draw_done_reached();                      // the renderer: the game's draw-done point is drawn
-void hw_run_locked(void (*fn)());                 // run fn holding the hardware lock
+void hw_run_locked(const std::function<void()>& fn);   // run fn holding the hardware lock
 
 // ---- the hardware (hw.cpp) -----------------------------------------------------------
 void hw_init();

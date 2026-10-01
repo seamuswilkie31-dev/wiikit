@@ -51,6 +51,9 @@ void video_set_lines(uint32_t lines);        // VI: lines of picture scanned out
 // 640 x 528, ARGB and 24-bit Z per pixel, rows top first. Waits for the
 // renderer; false with --no-video.
 bool video_efb_read(std::vector<uint32_t>& argb, std::vector<uint32_t>& z);
+// the EFB copy to texture at addr, at its native size w x h, as RGBA rows
+// from the top (as a texture unit reads it); in the queue's order
+bool video_copy_read(uint32_t addr, int w, int h, std::vector<uint8_t>& rgba);
 
 struct VideoOptions {
     bool enabled = true;

@@ -45,7 +45,7 @@ constexpr int EFB_W = 640, EFB_H = 528;
 using Clock = std::chrono::steady_clock;
 
 // ---- the queue from the game ------------------------------------------------------------------
-struct Chunk { std::vector<uint8_t> data; int frames; bool readback = false; };
+struct Chunk { std::vector<uint8_t> data; int frames; bool readback = false; uint32_t copy = 0; };   // copy: video_copy_read's
 std::mutex qmx;
 std::condition_variable q_space;
 std::deque<Chunk> q;
@@ -58,6 +58,8 @@ std::mutex rb_mx;
 std::condition_variable rb_cv;
 bool rb_ready = false;
 std::vector<uint32_t>*rb_argb = nullptr, *rb_z = nullptr;
+std::vector<uint8_t>* rb_rgba = nullptr;           // video_copy_read's
+int rb_w = 0, rb_h = 0;
 std::mutex pad_mx;
 PadState pad;
 ClassicState classic[4];
@@ -604,6 +606,25 @@ void efb_readback() {
             (*rb_argb)[d] = (uint32_t)c[3] << 24 | (uint32_t)c[0] << 16 | (uint32_t)c[1] << 8 | c[2];
             (*rb_z)[d] = (uint32_t)(std::clamp(dz[s], 0.0f, 1.0f) * 16777215.0f);
         }
+    rb_ready = true;
+    rb_cv.notify_all();
+}
+
+// An EFB copy to texture at its native size: the top-left sample of each
+// native pixel of the scaled copy (rows from the top, as it was copied).
+void copy_readback(uint32_t addr) {
+    std::lock_guard<std::mutex> lk(rb_mx);
+    rb_rgba->assign((size_t)rb_w * rb_h * 4, 0);
+    auto it = efb_copies.find(addr);
+    if (it != efb_copies.end() && it->second.name) {
+        const Tex& t = it->second;
+        std::vector<uint8_t> px((size_t)t.w * t.h * 4);
+        glPixelStorei(GL_PACK_ALIGNMENT, 1);
+        glGetTextureImage(t.name, 0, GL_RGBA, GL_UNSIGNED_BYTE, (GLsizei)px.size(), px.data());
+        for (int y = 0; y < rb_h && y * S < t.h; ++y)
+            for (int x = 0; x < rb_w && x * S < t.w; ++x)
+                std::memcpy(&(*rb_rgba)[((size_t)y * rb_w + x) * 4], &px[((size_t)y * S * t.w + (size_t)x * S) * 4], 4);
+    }
     rb_ready = true;
     rb_cv.notify_all();
 }
@@ -1326,6 +1347,29 @@ bool video_efb_read(std::vector<uint32_t>& argb, std::vector<uint32_t>& z) {
     return true;
 }
 
+bool video_copy_read(uint32_t addr, int w, int h, std::vector<uint8_t>& rgba) {
+    if (!opt.enabled) return false;
+    std::unique_lock<std::mutex> lk(rb_mx);
+    rb_rgba = &rgba;
+    rb_w = w;
+    rb_h = h;
+    rb_ready = false;
+    {
+        std::lock_guard<std::mutex> ql(qmx);
+        q.push_back(Chunk{{}, 0, true, addr});
+    }
+    if (wake) SDL_SignalSemaphore(wake);
+    while (!rb_ready) {                              // taking interrupts meanwhile, as video_efb_read
+        rb_cv.wait_for(lk, std::chrono::milliseconds(1));
+        if (!rb_ready && t_ppc && g_ppc_pending.load(std::memory_order_relaxed)) {
+            lk.unlock();
+            ppc_poll(*t_ppc);
+            lk.lock();
+        }
+    }
+    return true;
+}
+
 void video_set_xfb(uint32_t a) { xfb_addr.store(a); }
 void video_set_lines(uint32_t n) { vi_lines.store(n); }
 std::atomic<bool> want_relative{false};
@@ -1475,7 +1519,7 @@ void video_run(const char* title) {
                 c = std::move(q.front());
                 q.pop_front();
             }
-            if (c.readback) { efb_readback(); busy = true; continue; }
+            if (c.readback) { if (c.copy) copy_readback(c.copy); else efb_readback(); busy = true; continue; }
             auto te = Clock::now();
             exec(c.data);
             if (g_vperf_on) g_vperf.draw += (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - te).count();

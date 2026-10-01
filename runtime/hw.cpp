@@ -984,7 +984,7 @@ void hw_vi_preset(bool pal) {
     vi[0x1B] = 1;
 }
 
-void hw_run_locked(void (*fn)()) {
+void hw_run_locked(const std::function<void()>& fn) {
     std::lock_guard<std::recursive_mutex> lk(g_hw);
     fn();
 }
