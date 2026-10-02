@@ -28,6 +28,12 @@ the ports.
 | [pc-thelaststory](https://github.com/vs-sr-dev/pc-thelaststory) | The Last Story (2011, PAL) | FIFO breakpoints that stop the GP (its engine paces its frames on them) and the CP's overflow behind them, the PI's FIFO in 32-byte units, EFB copies written into RAM where the game reads them on the CPU (its dyed equipment, compressed to CMPR), `WPADGetInfo` |
 | [pc-finalfantasycrystalbearers](https://github.com/vs-sr-dev/pc-finalfantasycrystalbearers) | Final Fantasy Crystal Chronicles: The Crystal Bearers (2009) | the Nunchuk (its stick and C and Z on keys), a third `KPADStatus` size (0xB0), shader programs shared by their code and kept on disk (a game of hundreds of TEV set-ups, its cut-scenes no longer stalled by links seen before) |
 
+Each port says where it stands in a `.recomp.json` at its root
+([spec](https://recomp.fyi/spec)): the game, its system,
+`"toolchain": "wiikit"` and a status, which trackers such as
+[recomp.board](https://recomp.fyi) read. A new port adds one, and changes
+its status in the same commit as its README's.
+
 Some pieces were first written for two earlier Wii studies (The Last Story
 and Final Fantasy Crystal Chronicles: The Crystal Bearers): the disc
 extractor, the GX texture decoder, TPL, U8 and DSP-ADPCM.
