@@ -1180,6 +1180,72 @@ void update_pad() {
     for (int i = 0; i < 4; ++i) classic[i] = c[i];
 }
 
+// The port's overlay (video_overlay_update): handed over on any thread, uploaded
+// and drawn over the picture here, on the renderer's.
+std::mutex overlay_mx;
+std::vector<uint8_t> overlay_px;
+int overlay_w = 0, overlay_h = 0;
+uint64_t overlay_serial = 0;
+
+void draw_overlay(const Rect& r, int wh) {
+    static GLuint tex = 0, prog = 0;
+    static int tw = 0, th = 0;
+    static uint64_t shown = 0;
+    {
+        std::lock_guard<std::mutex> lk(overlay_mx);
+        if (!overlay_w || !overlay_h) return;
+        if (overlay_serial != shown) {
+            if (!tex || tw != overlay_w || th != overlay_h) {
+                if (tex) glDeleteTextures(1, &tex);
+                glCreateTextures(GL_TEXTURE_2D, 1, &tex);
+                glTextureStorage2D(tex, 1, GL_RGBA8, overlay_w, overlay_h);
+                glTextureParameteri(tex, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+                glTextureParameteri(tex, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+                glTextureParameteri(tex, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+                glTextureParameteri(tex, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+                tw = overlay_w;
+                th = overlay_h;
+            }
+            glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+            glTextureSubImage2D(tex, 0, 0, 0, tw, th, GL_RGBA, GL_UNSIGNED_BYTE, overlay_px.data());
+            shown = overlay_serial;
+        }
+    }
+    if (!prog) {
+        prog = link(
+            "#version 450\n"
+            "out vec2 uv;\n"
+            "void main() {\n"
+            "    vec2 p = vec2((gl_VertexID << 1) & 2, gl_VertexID & 2);\n"   // a triangle over the viewport
+            "    uv = vec2(p.x, 1.0 - p.y);\n"                                   // rows top first
+            "    gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0);\n"
+            "}\n",
+            "#version 450\n"
+            "in vec2 uv;\n"
+            "layout(binding = 0) uniform sampler2D overlay;\n"
+            "out vec4 col;\n"
+            "void main() { col = texture(overlay, uv); }\n");
+        if (!prog) return;
+    }
+    // The game's draws set their viewport, program and blending each time: nothing to restore but
+    // blending off and the usual vertex array. GL's rows count from the bottom; the picture is
+    // centred, so its rectangle reads the same either way.
+    glViewport((GLint)std::lround(r.x), wh - (GLint)std::lround(r.y + r.h), (GLsizei)std::lround(r.w), (GLsizei)std::lround(r.h));
+    glEnable(GL_BLEND);
+    glBlendEquation(GL_FUNC_ADD);
+    glBlendFuncSeparate(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA, GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
+    glDisable(GL_DEPTH_TEST);
+    glDisable(GL_SCISSOR_TEST);
+    glDisable(GL_COLOR_LOGIC_OP);
+    glUseProgram(prog);
+    glBindTextureUnit(0, tex);
+    glBindSampler(0, 0);
+    glBindVertexArray(empty_vao);
+    glDrawArrays(GL_TRIANGLES, 0, 3);
+    glBindVertexArray(vao);
+    glDisable(GL_BLEND);
+}
+
 void present() {
     ++cnt.presents;
     int ww = 0, wh = 0;
@@ -1199,6 +1265,7 @@ void present() {
         glNamedFramebufferTexture(copy_fbo, GL_COLOR_ATTACHMENT0, t.name, 0);
         glBlitNamedFramebuffer(copy_fbo, 0, 0, 0, t.w, t.h, dx, dy + dh, dx + dw, dy,   // top row first
                                GL_COLOR_BUFFER_BIT, GL_LINEAR);
+        draw_overlay(r, wh);
     }
     if (opt.dump_dir && cnt.presents % (uint64_t)opt.dump_every == 0 && ww > 0 && wh > 0) {
         std::vector<uint8_t> px((size_t)ww * wh * 4), flip(px.size());   // the window, as shown
@@ -1380,6 +1447,18 @@ void video_take_mouse_motion(float& dx, float& dy) {
     std::lock_guard<std::mutex> lk(motion_mx);
     dx = motion_x; dy = motion_y;
     motion_x = motion_y = 0;
+}
+
+void video_overlay_update(const uint8_t* rgba, int w, int h) {
+    std::lock_guard<std::mutex> lk(overlay_mx);
+    if (!rgba || w <= 0 || h <= 0) {
+        overlay_w = overlay_h = 0;
+        return;
+    }
+    overlay_px.assign(rgba, rgba + (size_t)w * h * 4);
+    overlay_w = w;
+    overlay_h = h;
+    ++overlay_serial;
 }
 
 PadState video_pad() {

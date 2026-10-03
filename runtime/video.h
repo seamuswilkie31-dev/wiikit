@@ -95,6 +95,12 @@ void video_set_rumble(int chan, bool on);
 void video_set_relative_mouse(bool on);
 void video_take_mouse_motion(float& dx, float& dy);
 
+// A port's overlay: an RGBA image (straight alpha, rows top first) drawn over
+// the game's picture at every present, stretched to it, so it scales with the
+// window. Any thread may hand a new one over (the renderer copies it); null
+// or a zero size takes it away.
+void video_overlay_update(const uint8_t* rgba, int w, int h);
+
 // WIIKIT_PERF=1: where a frame's time goes, reported every second by the
 // renderer. Nanoseconds, summed since the last report.
 struct VideoPerf {
