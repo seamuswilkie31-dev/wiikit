@@ -268,7 +268,10 @@ void bind_map(int m) {
         }
         static const char* dump = std::getenv("WIIKIT_TEXDUMP");     // debugging: uploads as PNGs
         static int dumped = 0;
-        if (dump && dumped < 400 && w * h >= 4096) {
+        // WIIKIT_TEXDUMP_MAX: how many (400); WIIKIT_TEXDUMP_MIN: the smallest, in pixels (4096)
+        static const int dump_max = std::getenv("WIIKIT_TEXDUMP_MAX") ? std::atoi(std::getenv("WIIKIT_TEXDUMP_MAX")) : 400;
+        static const int dump_min = std::getenv("WIIKIT_TEXDUMP_MIN") ? std::atoi(std::getenv("WIIKIT_TEXDUMP_MIN")) : 4096;
+        if (dump && dumped < dump_max && w * h >= dump_min) {
             char name[512];
             std::snprintf(name, sizeof name, "%s/tex_%04d_%08X_f%u_%dx%d.png", dump, dumped++, addr, fmt, w, h);
             write_png(name, w, h, rec.data() + at);
