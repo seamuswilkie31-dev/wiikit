@@ -103,13 +103,19 @@ void video_overlay_update(const uint8_t* rgba, int w, int h);
 
 // A port's 3D model, drawn into the game's scene just before each frame is
 // copied out for display, depth-tested against it with the scene's own
-// projection and viewport. Any thread may call these.
-// verts: n vertices, each x y z (the model's space) u v layer; rgba: layers
-// textures of w x h each, stacked top to bottom; UVs wrap.
+// projection and viewport, skinned on its joints. Any thread may call these.
+// verts: n triangle corners of 13 floats: p0 x y z, p1 x y z, joint 0, joint 1
+// (-1: none), weight 0, weight 1, u v layer. A corner is at
+// J0 (p0, w0) + J1 (p1, w1): each position in its joint's space, already
+// weighted (J (p, w) = R p + w t). rgba: layers textures of w x h each,
+// stacked top to bottom; UVs wrap.
 void video_model_mesh(const float* verts, int n, const uint8_t* rgba, int layers, int w, int h);
 // view: the model's space to the camera's (3x4, rows); proj: GX's six
 // perspective parameters (XF 0x1020-0x1025); not drawn while visible is false.
 void video_model_pose(const float view[12], const float proj[6], bool visible);
+// The joints in the model's space: n (at most 128) 3x4 matrices, rows. Not
+// drawn before the first.
+void video_model_joints(const float* rows, int n);
 
 // WIIKIT_PERF=1: where a frame's time goes, reported every second by the
 // renderer. Nanoseconds, summed since the last report.

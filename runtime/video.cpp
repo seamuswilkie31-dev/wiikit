@@ -264,36 +264,47 @@ int model_n = 0, model_layers = 0, model_tw = 0, model_th = 0;
 uint64_t model_serial = 0;
 float model_view[12], model_proj[6];
 bool model_visible = false;
-constexpr int kModelMaxVerts = 200000;
+std::vector<float> model_joints;                 // 3x4 rows per joint
+uint64_t model_joints_serial = 0;
+constexpr int kModelMaxVerts = 200000, kModelVertFloats = 13, kModelMaxJoints = 128;
 
 // Into the EFB before it goes to the XFB: depth-tested against the scene, with
 // GX's projection and the scene's viewport, as gxshader's own draws. Its own
-// vertex array, buffer, texture unit (15) and uniform block (7): the game's
-// draws set everything else themselves.
+// vertex array, buffer, texture unit (15) and uniform blocks (7, 8): the
+// game's draws set everything else themselves. Skinned here: each vertex on
+// one joint or two (video_model_mesh), the joints as the port last posed them.
 void draw_model() {
-    static GLuint prog = 0, vbuf = 0, mvao = 0, tex = 0, ubo = 0;
-    static uint64_t shown = 0;
+    static GLuint prog = 0, vbuf = 0, mvao = 0, tex = 0, ubo = 0, jubo = 0;
+    static uint64_t shown = 0, joints_shown = 0;
     static int n = 0, layers = 1;
     float ub[24];
     {
         std::lock_guard<std::mutex> lk(model_mx);
-        if (!model_visible || !model_n || !scene_vp.ok) return;
+        if (!model_visible || !model_n || model_joints.empty() || !scene_vp.ok) return;
         if (!vbuf) {
             glCreateBuffers(1, &vbuf);
-            glNamedBufferStorage(vbuf, (GLsizeiptr)kModelMaxVerts * 6 * 4, nullptr, GL_DYNAMIC_STORAGE_BIT);
+            glNamedBufferStorage(vbuf, (GLsizeiptr)kModelMaxVerts * kModelVertFloats * 4, nullptr, GL_DYNAMIC_STORAGE_BIT);
             glCreateBuffers(1, &ubo);
             glNamedBufferStorage(ubo, sizeof ub, nullptr, GL_DYNAMIC_STORAGE_BIT);
+            glCreateBuffers(1, &jubo);
+            glNamedBufferStorage(jubo, kModelMaxJoints * 12 * 4, nullptr, GL_DYNAMIC_STORAGE_BIT);
             glCreateVertexArrays(1, &mvao);
-            glVertexArrayVertexBuffer(mvao, 0, vbuf, 0, 6 * 4);
-            for (GLuint a = 0; a < 2; ++a) {
+            glVertexArrayVertexBuffer(mvao, 0, vbuf, 0, kModelVertFloats * 4);
+            const GLint size[4] = {3, 3, 4, 3};                  // p0, p1, joints and weights, u v layer
+            const GLuint at[4] = {0, 12, 24, 40};
+            for (GLuint a = 0; a < 4; ++a) {
                 glEnableVertexArrayAttrib(mvao, a);
-                glVertexArrayAttribFormat(mvao, a, 3, GL_FLOAT, GL_FALSE, a * 12);
+                glVertexArrayAttribFormat(mvao, a, size[a], GL_FLOAT, GL_FALSE, at[a]);
                 glVertexArrayAttribBinding(mvao, a, 0);
             }
         }
+        if (model_joints_serial != joints_shown) {
+            joints_shown = model_joints_serial;
+            glNamedBufferSubData(jubo, 0, (GLsizeiptr)model_joints.size() * 4, model_joints.data());
+        }
         if (model_serial != shown) {
             n = std::min(model_n, kModelMaxVerts);
-            glNamedBufferSubData(vbuf, 0, (GLsizeiptr)n * 6 * 4, model_verts.data());
+            glNamedBufferSubData(vbuf, 0, (GLsizeiptr)n * kModelVertFloats * 4, model_verts.data());
             if (tex) glDeleteTextures(1, &tex);
             layers = std::max(1, model_layers);
             // the layers as an array with mipmaps: seen from afar, a texture is
@@ -324,12 +335,23 @@ void draw_model() {
     if (!prog) {
         prog = link(
             "#version 450\n"
-            "layout(location = 0) in vec3 a_pos;\n"
-            "layout(location = 1) in vec3 a_uvl;\n"
+            "layout(location = 0) in vec3 a_p0;\n"
+            "layout(location = 1) in vec3 a_p1;\n"
+            "layout(location = 2) in vec4 a_jw;\n"                 // joint 0, joint 1 (-1: none), their weights
+            "layout(location = 3) in vec3 a_uvl;\n"
             "layout(std140, binding = 7) uniform Model { vec4 mv[3]; vec4 pr0; vec4 pr1; vec4 vp; };\n"
+            "layout(std140, binding = 8) uniform Joints { vec4 jm[384]; };\n"
             "out vec3 uvl;\n"
+            // a joint's rows on a position already weighted: its turn, its offset by the weight
+            "vec3 on(int j, vec3 q, float w) {\n"
+            "    vec4 h = vec4(q, w);\n"
+            "    return vec3(dot(jm[3 * j], h), dot(jm[3 * j + 1], h), dot(jm[3 * j + 2], h));\n"
+            "}\n"
             "void main() {\n"
-            "    vec4 p = vec4(a_pos, 1.0);\n"
+            "    int j0 = int(a_jw.x), j1 = int(a_jw.y);\n"
+            "    vec3 m = on(j0, a_p0, a_jw.z);\n"
+            "    if (j1 >= 0) m += on(j1, a_p1, a_jw.w);\n"
+            "    vec4 p = vec4(m, 1.0);\n"
             "    vec3 pos = vec3(dot(mv[0], p), dot(mv[1], p), dot(mv[2], p));\n"
             "    vec4 clip = vec4(pr0.x * pos.x + pr0.y * pos.z, pr0.z * pos.y + pr0.w * pos.z, pr1.x * pos.z + pr1.y, -pos.z);\n"
             "    clip.z = clip.w * vp.x + clip.z * vp.y;\n"            // as gxshader: GX's depth range
@@ -358,6 +380,7 @@ void draw_model() {
     }
     glNamedBufferSubData(ubo, 0, sizeof ub, ub);
     glBindBufferBase(GL_UNIFORM_BUFFER, 7, ubo);
+    glBindBufferBase(GL_UNIFORM_BUFFER, 8, jubo);
     glBindFramebuffer(GL_FRAMEBUFFER, efb_fbo);
     glViewportIndexedf(0, scene_vp.x, scene_vp.y, scene_vp.w, scene_vp.h);
     glDisable(GL_SCISSOR_TEST);
@@ -1585,7 +1608,7 @@ void video_model_mesh(const float* verts, int n, const uint8_t* rgba, int layers
         return;
     }
     n = std::min(n, kModelMaxVerts);
-    model_verts.assign(verts, verts + (size_t)n * 6);
+    model_verts.assign(verts, verts + (size_t)n * kModelVertFloats);
     model_tex.assign(rgba, rgba + (size_t)w * h * layers * 4);
     model_n = n;
     model_layers = layers;
@@ -1599,6 +1622,13 @@ void video_model_pose(const float view[12], const float proj[6], bool visible) {
     std::memcpy(model_view, view, sizeof model_view);
     std::memcpy(model_proj, proj, sizeof model_proj);
     model_visible = visible;
+}
+
+void video_model_joints(const float* rows, int n) {
+    std::lock_guard<std::mutex> lk(model_mx);
+    n = std::clamp(n, 0, kModelMaxJoints);
+    model_joints.assign(rows, rows + (size_t)n * 12);
+    ++model_joints_serial;
 }
 
 void video_overlay_update(const uint8_t* rgba, int w, int h) {
