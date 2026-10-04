@@ -252,6 +252,119 @@ void efb_clear(int x, int y, int w, int h) {
 long efb_dump_frame = std::getenv("WIIKIT_EFBDUMP") ? std::atol(std::getenv("WIIKIT_EFBDUMP")) : -1;
 long efb_dump_every = std::getenv("WIIKIT_EFBDUMP_EVERY") ? std::atol(std::getenv("WIIKIT_EFBDUMP_EVERY")) : 0;
 bool efb_dumping() { return (long)cnt.frames == efb_dump_frame; }
+// The scene's viewport and depth range: the last perspective draw's (2D drawn
+// after it, a HUD, has its own); a port's model is drawn with them.
+struct SceneVp { bool ok = false; float x, y, w, h, farz, zrange, sx, sy; } scene_vp;
+
+// A port's 3D model (video_model_mesh, video_model_pose).
+std::mutex model_mx;
+std::vector<float> model_verts;
+std::vector<uint8_t> model_tex;
+int model_n = 0, model_layers = 0, model_tw = 0, model_th = 0;
+uint64_t model_serial = 0;
+float model_view[12], model_proj[6];
+bool model_visible = false;
+constexpr int kModelMaxVerts = 200000;
+
+// Into the EFB before it goes to the XFB: depth-tested against the scene, with
+// GX's projection and the scene's viewport, as gxshader's own draws. Its own
+// vertex array, buffer, texture unit (15) and uniform block (7): the game's
+// draws set everything else themselves.
+void draw_model() {
+    static GLuint prog = 0, vbuf = 0, mvao = 0, tex = 0, ubo = 0;
+    static uint64_t shown = 0;
+    static int n = 0, layers = 1;
+    float ub[24];
+    {
+        std::lock_guard<std::mutex> lk(model_mx);
+        if (!model_visible || !model_n || !scene_vp.ok) return;
+        if (!vbuf) {
+            glCreateBuffers(1, &vbuf);
+            glNamedBufferStorage(vbuf, (GLsizeiptr)kModelMaxVerts * 6 * 4, nullptr, GL_DYNAMIC_STORAGE_BIT);
+            glCreateBuffers(1, &ubo);
+            glNamedBufferStorage(ubo, sizeof ub, nullptr, GL_DYNAMIC_STORAGE_BIT);
+            glCreateVertexArrays(1, &mvao);
+            glVertexArrayVertexBuffer(mvao, 0, vbuf, 0, 6 * 4);
+            for (GLuint a = 0; a < 2; ++a) {
+                glEnableVertexArrayAttrib(mvao, a);
+                glVertexArrayAttribFormat(mvao, a, 3, GL_FLOAT, GL_FALSE, a * 12);
+                glVertexArrayAttribBinding(mvao, a, 0);
+            }
+        }
+        if (model_serial != shown) {
+            n = std::min(model_n, kModelMaxVerts);
+            glNamedBufferSubData(vbuf, 0, (GLsizeiptr)n * 6 * 4, model_verts.data());
+            if (tex) glDeleteTextures(1, &tex);
+            layers = std::max(1, model_layers);
+            glCreateTextures(GL_TEXTURE_2D, 1, &tex);
+            glTextureStorage2D(tex, 1, GL_RGBA8, model_tw, model_th * layers);
+            glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+            glTextureSubImage2D(tex, 0, 0, 0, model_tw, model_th * layers, GL_RGBA, GL_UNSIGNED_BYTE, model_tex.data());
+            glTextureParameteri(tex, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+            glTextureParameteri(tex, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+            glTextureParameteri(tex, GL_TEXTURE_WRAP_S, GL_REPEAT);
+            glTextureParameteri(tex, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+            shown = model_serial;
+        }
+        for (int r = 0; r < 3; ++r)
+            for (int c = 0; c < 4; ++c) ub[r * 4 + c] = model_view[r * 4 + c];
+        ub[12] = model_proj[0]; ub[13] = model_proj[1]; ub[14] = model_proj[2]; ub[15] = model_proj[3];
+        ub[16] = model_proj[4]; ub[17] = model_proj[5]; ub[18] = (float)layers; ub[19] = 0;
+    }
+    ub[20] = scene_vp.farz / 16777216.0f;
+    ub[21] = scene_vp.zrange / 16777216.0f;
+    ub[22] = scene_vp.sx;
+    ub[23] = scene_vp.sy;
+    if (!prog) {
+        prog = link(
+            "#version 450\n"
+            "layout(location = 0) in vec3 a_pos;\n"
+            "layout(location = 1) in vec3 a_uvl;\n"
+            "layout(std140, binding = 7) uniform Model { vec4 mv[3]; vec4 pr0; vec4 pr1; vec4 vp; };\n"
+            "out vec3 uvl;\n"
+            "void main() {\n"
+            "    vec4 p = vec4(a_pos, 1.0);\n"
+            "    vec3 pos = vec3(dot(mv[0], p), dot(mv[1], p), dot(mv[2], p));\n"
+            "    vec4 clip = vec4(pr0.x * pos.x + pr0.y * pos.z, pr0.z * pos.y + pr0.w * pos.z, pr1.x * pos.z + pr1.y, -pos.z);\n"
+            "    clip.z = clip.w * vp.x + clip.z * vp.y;\n"            // as gxshader: GX's depth range
+            "    if (vp.z < 0.0) clip.x = -clip.x;\n"
+            "    if (vp.w < 0.0) clip.y = -clip.y;\n"
+            "    gl_Position = clip;\n"
+            "    uvl = a_uvl;\n"
+            "}\n",
+            "#version 450\n"
+            "in vec3 uvl;\n"
+            "layout(std140, binding = 7) uniform Model { vec4 mv[3]; vec4 pr0; vec4 pr1; vec4 vp; };\n"
+            "layout(binding = 15) uniform sampler2D tex;\n"
+            "out vec4 col;\n"
+            "void main() {\n"
+            "    vec2 uv = vec2(uvl.x, fract(uvl.y));\n"
+            "    vec4 c = texture(tex, vec2(uv.x, (uvl.z + uv.y) / pr1.z));\n"   // the layer's band
+            "    if (c.a < 0.5) discard;\n"
+            "    col = vec4(c.rgb, 1.0);\n"
+            "}\n");
+        if (!prog) { model_visible = false; return; }
+    }
+    glNamedBufferSubData(ubo, 0, sizeof ub, ub);
+    glBindBufferBase(GL_UNIFORM_BUFFER, 7, ubo);
+    glBindFramebuffer(GL_FRAMEBUFFER, efb_fbo);
+    glViewportIndexedf(0, scene_vp.x, scene_vp.y, scene_vp.w, scene_vp.h);
+    glDisable(GL_SCISSOR_TEST);
+    glEnable(GL_DEPTH_TEST);
+    glDepthFunc(GL_LEQUAL);
+    glDepthMask(GL_TRUE);
+    glColorMask(1, 1, 1, 1);
+    glDisable(GL_BLEND);
+    glDisable(GL_COLOR_LOGIC_OP);
+    glDisable(GL_CULL_FACE);
+    glUseProgram(prog);
+    glBindTextureUnit(15, tex);
+    glBindSampler(15, 0);
+    glBindVertexArray(mvao);
+    glDrawArrays(GL_TRIANGLES, 0, n);
+    glBindVertexArray(vao);
+}
+
 void efb_dump(const char* tag) {
     static int k = 0;
     std::vector<uint8_t> px((size_t)EFB_W * S * EFB_H * S * 4);   // top row first, as the EFB is kept
@@ -274,6 +387,8 @@ void efb_copy(uint32_t v) {
     if (v >> 14 & 1) {                                           // to the XFB
         Tex& t = xfbs[dest];
         ensure_tex(t, w * S, h * S, 1);
+        draw_model();                                            // a port's model, into the scene
+        glDisable(GL_SCISSOR_TEST);
         glNamedFramebufferTexture(copy_fbo, GL_COLOR_ATTACHMENT0, t.name, 0);
         glBlitNamedFramebuffer(efb_fbo, copy_fbo, x * S, y * S, (x + w) * S, (y + h) * S, 0, 0, w * S, h * S,
                                GL_COLOR_BUFFER_BIT, GL_NEAREST);
@@ -450,6 +565,9 @@ void draw(uint8_t prim, uint8_t vflags, const uint8_t* pieces, uint32_t npieces)
     float wd = std::fabs(fx(0x101A)), ht = std::fabs(fx(0x101B));
     glViewportIndexedf(0, (fx(0x101D) - wd - (float)offx) * (float)S, (fx(0x101E) - ht - (float)offy) * (float)S,
                        2 * wd * (float)S, 2 * ht * (float)S);
+    if (xf[0x1026] == 0)                                         // a perspective draw: the scene's viewport
+        scene_vp = {true, (fx(0x101D) - wd - (float)offx) * (float)S, (fx(0x101E) - ht - (float)offy) * (float)S,
+                    2 * wd * (float)S, 2 * ht * (float)S, fx(0x101F), fx(0x101C), fx(0x101A), fx(0x101B)};
     int sx0 = (int)(bp[0x20] >> 12 & 0x7FF) - offx, sy0 = (int)(bp[0x20] & 0x7FF) - offy;
     int sx1 = (int)(bp[0x21] >> 12 & 0x7FF) - offx + 1, sy1 = (int)(bp[0x21] & 0x7FF) - offy + 1;
     sx0 = std::max(sx0, 0); sy0 = std::max(sy0, 0); sx1 = std::min(sx1, EFB_W); sy1 = std::min(sy1, EFB_H);
@@ -1447,6 +1565,29 @@ void video_take_mouse_motion(float& dx, float& dy) {
     std::lock_guard<std::mutex> lk(motion_mx);
     dx = motion_x; dy = motion_y;
     motion_x = motion_y = 0;
+}
+
+void video_model_mesh(const float* verts, int n, const uint8_t* rgba, int layers, int w, int h) {
+    std::lock_guard<std::mutex> lk(model_mx);
+    if (!verts || n <= 0 || !rgba || layers <= 0 || w <= 0 || h <= 0) {
+        model_n = 0;
+        return;
+    }
+    n = std::min(n, kModelMaxVerts);
+    model_verts.assign(verts, verts + (size_t)n * 6);
+    model_tex.assign(rgba, rgba + (size_t)w * h * layers * 4);
+    model_n = n;
+    model_layers = layers;
+    model_tw = w;
+    model_th = h;
+    ++model_serial;
+}
+
+void video_model_pose(const float view[12], const float proj[6], bool visible) {
+    std::lock_guard<std::mutex> lk(model_mx);
+    std::memcpy(model_view, view, sizeof model_view);
+    std::memcpy(model_proj, proj, sizeof model_proj);
+    model_visible = visible;
 }
 
 void video_overlay_update(const uint8_t* rgba, int w, int h) {

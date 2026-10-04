@@ -101,6 +101,16 @@ void video_take_mouse_motion(float& dx, float& dy);
 // or a zero size takes it away.
 void video_overlay_update(const uint8_t* rgba, int w, int h);
 
+// A port's 3D model, drawn into the game's scene just before each frame is
+// copied out for display, depth-tested against it with the scene's own
+// projection and viewport. Any thread may call these.
+// verts: n vertices, each x y z (the model's space) u v layer; rgba: layers
+// textures of w x h each, stacked top to bottom; UVs wrap.
+void video_model_mesh(const float* verts, int n, const uint8_t* rgba, int layers, int w, int h);
+// view: the model's space to the camera's (3x4, rows); proj: GX's six
+// perspective parameters (XF 0x1020-0x1025); not drawn while visible is false.
+void video_model_pose(const float view[12], const float proj[6], bool visible);
+
 // WIIKIT_PERF=1: where a frame's time goes, reported every second by the
 // renderer. Nanoseconds, summed since the last report.
 struct VideoPerf {
