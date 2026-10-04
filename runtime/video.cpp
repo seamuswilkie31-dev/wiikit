@@ -345,6 +345,12 @@ void draw_model() {
             "}\n");
         if (!prog) { model_visible = false; return; }
     }
+    static bool told = false;
+    if (!told) {                                             // once: where it goes, for a port's diagnosis
+        told = true;
+        rt_log("video: a port's model: %d vertices, %d layers; the scene's viewport %.0f,%.0f %.0fx%.0f, depth %g/%g, flips %g %g",
+               n, layers, scene_vp.x, scene_vp.y, scene_vp.w, scene_vp.h, ub[20], ub[21], ub[22], ub[23]);
+    }
     glNamedBufferSubData(ubo, 0, sizeof ub, ub);
     glBindBufferBase(GL_UNIFORM_BUFFER, 7, ubo);
     glBindFramebuffer(GL_FRAMEBUFFER, efb_fbo);
