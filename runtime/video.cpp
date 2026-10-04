@@ -296,14 +296,20 @@ void draw_model() {
             glNamedBufferSubData(vbuf, 0, (GLsizeiptr)n * 6 * 4, model_verts.data());
             if (tex) glDeleteTextures(1, &tex);
             layers = std::max(1, model_layers);
-            glCreateTextures(GL_TEXTURE_2D, 1, &tex);
-            glTextureStorage2D(tex, 1, GL_RGBA8, model_tw, model_th * layers);
+            // the layers as an array with mipmaps: seen from afar, a texture is
+            // averaged rather than sampled sparsely (shimmering), and no layer
+            // bleeds into the next
+            int levels = 1;
+            while ((std::max(model_tw, model_th) >> levels) > 0) ++levels;
+            glCreateTextures(GL_TEXTURE_2D_ARRAY, 1, &tex);
+            glTextureStorage3D(tex, levels, GL_RGBA8, model_tw, model_th, layers);
             glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
-            glTextureSubImage2D(tex, 0, 0, 0, model_tw, model_th * layers, GL_RGBA, GL_UNSIGNED_BYTE, model_tex.data());
-            glTextureParameteri(tex, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+            glTextureSubImage3D(tex, 0, 0, 0, 0, model_tw, model_th, layers, GL_RGBA, GL_UNSIGNED_BYTE, model_tex.data());
+            glGenerateTextureMipmap(tex);
+            glTextureParameteri(tex, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
             glTextureParameteri(tex, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
             glTextureParameteri(tex, GL_TEXTURE_WRAP_S, GL_REPEAT);
-            glTextureParameteri(tex, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+            glTextureParameteri(tex, GL_TEXTURE_WRAP_T, GL_REPEAT);
             shown = model_serial;
         }
         for (int r = 0; r < 3; ++r)
@@ -335,11 +341,10 @@ void draw_model() {
             "#version 450\n"
             "in vec3 uvl;\n"
             "layout(std140, binding = 7) uniform Model { vec4 mv[3]; vec4 pr0; vec4 pr1; vec4 vp; };\n"
-            "layout(binding = 15) uniform sampler2D tex;\n"
+            "layout(binding = 15) uniform sampler2DArray tex;\n"
             "out vec4 col;\n"
             "void main() {\n"
-            "    vec2 uv = vec2(uvl.x, fract(uvl.y));\n"
-            "    vec4 c = texture(tex, vec2(uv.x, (uvl.z + uv.y) / pr1.z));\n"   // the layer's band
+            "    vec4 c = texture(tex, uvl);\n"                       // u, v, the layer
             "    if (c.a < 0.5) discard;\n"
             "    col = vec4(c.rgb, 1.0);\n"
             "}\n");

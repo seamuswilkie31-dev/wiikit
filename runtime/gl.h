@@ -64,6 +64,9 @@
     X(PFNGLCREATETEXTURESPROC, glCreateTextures)                                                    \
     X(PFNGLTEXTURESTORAGE2DPROC, glTextureStorage2D)                                                \
     X(PFNGLTEXTURESUBIMAGE2DPROC, glTextureSubImage2D)                                              \
+    X(PFNGLTEXTURESTORAGE3DPROC, glTextureStorage3D)                                                \
+    X(PFNGLTEXTURESUBIMAGE3DPROC, glTextureSubImage3D)                                              \
+    X(PFNGLGENERATETEXTUREMIPMAPPROC, glGenerateTextureMipmap)                                      \
     X(PFNGLTEXTUREPARAMETERIPROC, glTextureParameteri)                                              \
     X(PFNGLBINDTEXTUREUNITPROC, glBindTextureUnit)                                                  \
     X(PFNGLDELETETEXTURESPROC, glDeleteTextures)                                                    \
