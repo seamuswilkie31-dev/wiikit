@@ -1228,8 +1228,30 @@ void update_rumble() {
     }
 }
 
+// A port's keyboard hook and text capture (video_set_key_hook, video_text_capture)
+std::atomic<bool (*)(int, const char*)> key_hook{nullptr};
+std::atomic<bool> text_capture{false};
+
 void update_pad() {
     const bool* ks = SDL_GetKeyboardState(nullptr);
+    static const bool none[SDL_SCANCODE_COUNT] = {};
+    // typing: the keys are the port's, not the game's; and those still held when it ends (the Enter that
+    // sent a line) stay the port's until they're let go
+    static bool muted[SDL_SCANCODE_COUNT] = {}, was_capturing = false;
+    static bool shown[SDL_SCANCODE_COUNT];
+    bool capturing = text_capture;
+    if (was_capturing && !capturing)
+        for (int k = 0; k < SDL_SCANCODE_COUNT; ++k) muted[k] = ks[k];
+    was_capturing = capturing;
+    if (capturing) {
+        ks = none;
+    } else {
+        for (int k = 0; k < SDL_SCANCODE_COUNT; ++k) {
+            if (!ks[k]) muted[k] = false;
+            shown[k] = ks[k] && !muted[k];
+        }
+        ks = shown;
+    }
     PadState p;
     bool alt = SDL_GetModState() & SDL_KMOD_ALT;           // Alt+Enter is fullscreen, nothing else
     float mx = 0, my = 0;
@@ -1613,6 +1635,8 @@ std::atomic<bool> want_relative{false};
 std::mutex motion_mx;
 float motion_x = 0, motion_y = 0;
 void video_set_relative_mouse(bool on) { want_relative = on; }
+void video_set_key_hook(bool (*fn)(int scancode, const char* text)) { key_hook = fn; }
+void video_text_capture(bool on) { text_capture = on; }
 void video_take_mouse_motion(float& dx, float& dy) {
     std::lock_guard<std::mutex> lk(motion_mx);
     dx = motion_x; dy = motion_y;
@@ -1712,8 +1736,20 @@ void video_run(const char* title) {
     for (;;) {
         SDL_Event e;
         bool quit = false;
+        {                                                     // the port's text capture, on this thread
+            static bool capturing = false;
+            if (text_capture != capturing) {
+                capturing = text_capture;
+                if (capturing) SDL_StartTextInput(win);
+                else SDL_StopTextInput(win);
+            }
+        }
         while (SDL_PollEvent(&e)) {
             if (e.type == SDL_EVENT_QUIT) quit = true;
+            if (auto hook = key_hook.load()) {                // the port's keyboard first
+                if (e.type == SDL_EVENT_KEY_DOWN && hook((int)e.key.scancode, nullptr)) continue;
+                if (e.type == SDL_EVENT_TEXT_INPUT && text_capture && hook(0, e.text.text)) continue;
+            }
             if (e.type == SDL_EVENT_GAMEPAD_ADDED) pad_added(e.gdevice.which);
             if (e.type == SDL_EVENT_GAMEPAD_REMOVED) pad_removed(e.gdevice.which);
             // F11 or Alt+Enter: fullscreen and back

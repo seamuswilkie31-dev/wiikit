@@ -96,6 +96,14 @@ void video_set_rumble(int chan, bool on);
 // the pause box), and the motion is summed until taken.
 void video_set_relative_mouse(bool on);
 void video_take_mouse_motion(float& dx, float& dy);
+// A port's keyboard hook, called on the window's thread for each key pressed
+// (scancode: SDL's; text null, repeats included) and, while text capture is
+// on, for each piece of text typed (scancode 0, text UTF-8). True: the key is
+// the port's (it opens no pause box, toggles nothing).
+void video_set_key_hook(bool (*fn)(int scancode, const char* text));
+// Text capture: while on, the keyboard is text for the port's hook (the IME
+// on), and the game reads every key as released.
+void video_text_capture(bool on);
 
 // A port's overlay: an RGBA image (straight alpha, rows top first) drawn over
 // the game's picture at every present, stretched to it, so it scales with the
