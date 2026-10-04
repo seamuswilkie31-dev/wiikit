@@ -19,6 +19,8 @@
 //   FRAME   (an XFB copy was recorded: one frame)
 //   DRAWDONE (the game asked to know when the GP has drawn everything so
 //            far: the renderer, reaching it, raises PE's finish interrupt)
+//   MODEL   u8 visible, u16 n, 12 f32 view, 6 f32 projection, n x 12 f32
+//           joints: a port's model as this frame shows it (video_model_frame)
 #pragma once
 #include <atomic>
 #include <cstdint>
@@ -34,7 +36,7 @@ struct GVtx {
 };
 static_assert(sizeof(GVtx) == 132, "GVtx layout");
 
-enum : uint8_t { VC_BP = 1, VC_XF, VC_DRAW, VC_TEXUP, VC_TEXBIND, VC_TEXEFB, VC_FRAME, VC_DRAWDONE };
+enum : uint8_t { VC_BP = 1, VC_XF, VC_DRAW, VC_TEXUP, VC_TEXBIND, VC_TEXEFB, VC_FRAME, VC_DRAWDONE, VC_MODEL };
 enum : uint8_t { VTX_COL0 = 1, VTX_COL1 = 2, VTX_NRM = 4, VTX_NBT = 8 };
 
 // video.cpp
@@ -110,12 +112,17 @@ void video_overlay_update(const uint8_t* rgba, int w, int h);
 // weighted (J (p, w) = R p + w t). rgba: layers textures of w x h each,
 // stacked top to bottom; UVs wrap.
 void video_model_mesh(const float* verts, int n, const uint8_t* rgba, int layers, int w, int h);
-// view: the model's space to the camera's (3x4, rows); proj: GX's six
-// perspective parameters (XF 0x1020-0x1025); not drawn while visible is false.
-void video_model_pose(const float view[12], const float proj[6], bool visible);
-// The joints in the model's space: n (at most 128) 3x4 matrices, rows. Not
-// drawn before the first.
-void video_model_joints(const float* rows, int n);
+// fn is called on the game's thread as each frame is done (the XFB copy, as
+// the game asks for it), before that copy is recorded: the moment the
+// game's memory holds what the frame showed. It may call video_model_frame.
+void video_set_frame_hook(void (*fn)());
+// From the frame hook only: the model as this frame shows it, recorded with
+// the frame's draws so that the renderer, however far behind the game, draws
+// it with the frame it belongs to. view: the model's space to the camera's
+// (3x4, rows); proj: GX's six perspective parameters (XF 0x1020-0x1025);
+// joints: n (at most 128) 3x4 matrices, rows, in the model's space. Not drawn
+// in a frame that records none, or visible false.
+void video_model_frame(const float view[12], const float proj[6], bool visible, const float* joints, int n);
 
 // WIIKIT_PERF=1: where a frame's time goes, reported every second by the
 // renderer. Nanoseconds, summed since the last report.

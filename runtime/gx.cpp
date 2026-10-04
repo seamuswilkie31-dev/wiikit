@@ -125,6 +125,7 @@ uint8_t* grow(size_t n) {
     return rec.data() + o;
 }
 template <class T> void put(T v) { std::memcpy(grow(sizeof v), &v, sizeof v); }
+void (*frame_hook)() = nullptr;                    // video_set_frame_hook
 // Draws of one primitive in a row with nothing between them (no register,
 // matrix or texture written) reach the renderer as one VC_DRAW of several
 // pieces, drawn with one call. Skinned models come as thousands of strips of
@@ -480,6 +481,8 @@ void bp_write(uint32_t v) {
     }
     if ((reg >= 0x80 && reg < 0x9C) || (reg >= 0xA0 && reg < 0xBC))
         tex_dirty |= (uint8_t)(1u << ((reg & 3) + (reg >= 0xA0 ? 4 : 0)));
+    if (reg == 0x52 && (bp[reg] >> 14 & 1) && video && frame_hook)
+        frame_hook();                                                 // the frame drawn: a port's turn
     if (video) {
         put<uint8_t>(VC_BP);
         put<uint32_t>(reg << 24 | bp[reg]);
@@ -630,6 +633,19 @@ void feed(const uint8_t* b, int n) {
 }  // namespace
 
 void gx_trace_next_frame() { trace_next = true; }
+
+void video_set_frame_hook(void (*fn)()) { frame_hook = fn; }
+
+void video_model_frame(const float view[12], const float proj[6], bool visible, const float* joints, int n) {
+    if (!video) return;
+    n = std::clamp(n, 0, 128);
+    put<uint8_t>(VC_MODEL);
+    put<uint8_t>(visible ? 1 : 0);
+    put<uint16_t>((uint16_t)n);
+    std::memcpy(grow(12 * 4), view, 12 * 4);
+    std::memcpy(grow(6 * 4), proj, 6 * 4);
+    if (n) std::memcpy(grow((size_t)n * 12 * 4), joints, (size_t)n * 12 * 4);
+}
 
 // The EFB as the CPU reads it: 0xC8000000 | y << 12 | x << 2, bit 22 for Z
 // (GXPeekARGB, GXPeekZ; a game reads the picture's brightness so). The

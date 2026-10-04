@@ -256,7 +256,7 @@ bool efb_dumping() { return (long)cnt.frames == efb_dump_frame; }
 // after it, a HUD, has its own); a port's model is drawn with them.
 struct SceneVp { bool ok = false; float x, y, w, h, farz, zrange, sx, sy; } scene_vp;
 
-// A port's 3D model (video_model_mesh, video_model_pose).
+// A port's 3D model (video_model_mesh, and each frame its VC_MODEL record).
 std::mutex model_mx;
 std::vector<float> model_verts;
 std::vector<uint8_t> model_tex;
@@ -422,6 +422,11 @@ void efb_copy(uint32_t v) {
         Tex& t = xfbs[dest];
         ensure_tex(t, w * S, h * S, 1);
         draw_model();                                            // a port's model, into the scene
+        {                                                        // each frame its own: a frame with no
+            std::lock_guard<std::mutex> lk(model_mx);            // model recorded, or no 3D scene, shows none
+            model_visible = false;
+        }
+        scene_vp.ok = false;
         glDisable(GL_SCISSOR_TEST);
         glNamedFramebufferTexture(copy_fbo, GL_COLOR_ATTACHMENT0, t.name, 0);
         glBlitNamedFramebuffer(efb_fbo, copy_fbo, x * S, y * S, (x + w) * S, (y + h) * S, 0, 0, w * S, h * S,
@@ -823,6 +828,19 @@ void exec(const std::vector<uint8_t>& data) {
         case VC_TEXEFB: { uint8_t m = rd<uint8_t>(p); map_src[m] = 1ull << 32 | rd<uint32_t>(p); break; }
         case VC_FRAME: break;
         case VC_DRAWDONE: gx_draw_done_reached(); break;
+        case VC_MODEL: {                                             // the port's model in this frame
+            bool vis = rd<uint8_t>(p) != 0;
+            int n = std::min<int>(rd<uint16_t>(p), kModelMaxJoints);
+            std::lock_guard<std::mutex> lk(model_mx);
+            std::memcpy(model_view, p, sizeof model_view);
+            std::memcpy(model_proj, p + sizeof model_view, sizeof model_proj);
+            p += sizeof model_view + sizeof model_proj;
+            model_joints.assign(reinterpret_cast<const float*>(p), reinterpret_cast<const float*>(p) + (size_t)n * 12);
+            p += (size_t)n * 12 * 4;
+            ++model_joints_serial;
+            model_visible = vis;
+            break;
+        }
         default: rt_die("video: bad record byte %02X", p[-1]);
         }
     }
@@ -1617,19 +1635,6 @@ void video_model_mesh(const float* verts, int n, const uint8_t* rgba, int layers
     ++model_serial;
 }
 
-void video_model_pose(const float view[12], const float proj[6], bool visible) {
-    std::lock_guard<std::mutex> lk(model_mx);
-    std::memcpy(model_view, view, sizeof model_view);
-    std::memcpy(model_proj, proj, sizeof model_proj);
-    model_visible = visible;
-}
-
-void video_model_joints(const float* rows, int n) {
-    std::lock_guard<std::mutex> lk(model_mx);
-    n = std::clamp(n, 0, kModelMaxJoints);
-    model_joints.assign(rows, rows + (size_t)n * 12);
-    ++model_joints_serial;
-}
 
 void video_overlay_update(const uint8_t* rgba, int w, int h) {
     std::lock_guard<std::mutex> lk(overlay_mx);
