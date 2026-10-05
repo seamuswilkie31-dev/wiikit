@@ -139,6 +139,9 @@ void video_set_frame_hook(void (*fn)());
 // frame that records none, or visible false.
 void video_model_frame(const float view[12], const float proj[6], bool visible, const float* joints, int n,
                        const float* camera = nullptr);
+// How bright the model's textures are under the game's light: lit, each texel times the light times
+// gain (1: as the game's own; 2: textures made for twice the light, as FFXI's). Any thread; 1 at first.
+void video_model_gain(float gain);
 
 // WIIKIT_PERF=1: where a frame's time goes, reported every second by the
 // renderer. Nanoseconds, summed since the last report.

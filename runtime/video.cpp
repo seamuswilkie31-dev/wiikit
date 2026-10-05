@@ -343,6 +343,7 @@ void catch_light(const GVtx& v) {
 struct Ground { bool hit = false; float t = 0.0f, rgb[3] = {}; } ground_frame;
 float ground_shade = 1.0f;
 float kGroundRef = 0.8f, kGroundMin = 0.2f;
+std::atomic<float> model_gain{1.0f};            // video_model_gain
 
 void probe_ground(uint8_t prim, const uint8_t* pieces, uint32_t npieces) {
     const float* c = model_camera;
@@ -637,7 +638,7 @@ void draw_model() {
     glNamedBufferSubData(ubo, 0, sizeof ub, ub);
     ModelLight lit{};                                          // (the renderer's alone: no lock)
     if (!model_light(lit)) lit = ModelLight{};                 // info.w 0: unlit, the textures as they are
-    float shade = model_shade();
+    float shade = model_shade() * (lit.info[3] ? model_gain.load(std::memory_order_relaxed) : 1.0f);
     for (int k = 0; k < 3; ++k) lit.shade[k] = shade;
     lit.shade[3] = 1.0f;
     static bool told_light = false;
@@ -1927,6 +1928,10 @@ void video_take_mouse_motion(float& dx, float& dy) {
     std::lock_guard<std::mutex> lk(motion_mx);
     dx = motion_x; dy = motion_y;
     motion_x = motion_y = 0;
+}
+
+void video_model_gain(float gain) {
+    model_gain.store(std::clamp(gain, 0.1f, 8.0f), std::memory_order_relaxed);
 }
 
 void video_model_mesh(const float* verts, int n, const uint8_t* rgba, int layers, int w, int h) {
