@@ -343,7 +343,7 @@ void catch_light(const GVtx& v) {
 struct Ground { bool hit = false; float t = 0.0f, rgb[3] = {}; } ground_frame;
 float ground_shade = 1.0f;
 float kGroundRef = 0.8f, kGroundMin = 0.2f;
-std::atomic<float> model_gain{1.0f};            // video_model_gain
+std::atomic<float> model_gain{1.0f}, model_ground{0.0f};   // video_model_shading
 
 void probe_ground(uint8_t prim, const uint8_t* pieces, uint32_t npieces) {
     const float* c = model_camera;
@@ -638,7 +638,8 @@ void draw_model() {
     glNamedBufferSubData(ubo, 0, sizeof ub, ub);
     ModelLight lit{};                                          // (the renderer's alone: no lock)
     if (!model_light(lit)) lit = ModelLight{};                 // info.w 0: unlit, the textures as they are
-    float shade = model_shade() * (lit.info[3] ? model_gain.load(std::memory_order_relaxed) : 1.0f);
+    float ground = model_ground.load(std::memory_order_relaxed);
+    float shade = (1.0f + (model_shade() - 1.0f) * ground) * (lit.info[3] ? model_gain.load(std::memory_order_relaxed) : 1.0f);
     for (int k = 0; k < 3; ++k) lit.shade[k] = shade;
     lit.shade[3] = 1.0f;
     static bool told_light = false;
@@ -874,7 +875,7 @@ void draw(uint8_t prim, uint8_t vflags, const uint8_t* pieces, uint32_t npieces)
     if (!(vflags & VTX_PNMTX) && (vflags & VTX_COL0) && tri && xf[0x1026] == 0 && (xf[0x1009] & 3) &&
         (xf[0x100E] & 1) && (!(xf[0x100E] >> 1 & 1) || !((xf[0x100E] >> 2 & 15) | (xf[0x100E] >> 11 & 15))) &&
         (bp[0x00] >> 10 & 15) == 0 && !(bp[0x41] & 1) && (bp[0x40] >> 4 & 1) &&
-        model_shown)                                           // (solid: no blending, depth written)
+        model_shown && model_ground.load(std::memory_order_relaxed) > 0.0f)   // (solid: no blending, depth written)
         probe_ground(prim, pieces, npieces);                   // the scenery, its light baked: under the model?
     if (tri && cull == 3) return;
     vflags &= (uint8_t)~VTX_PNMTX;
@@ -1930,8 +1931,9 @@ void video_take_mouse_motion(float& dx, float& dy) {
     motion_x = motion_y = 0;
 }
 
-void video_model_gain(float gain) {
+void video_model_shading(float gain, float ground) {
     model_gain.store(std::clamp(gain, 0.1f, 8.0f), std::memory_order_relaxed);
+    model_ground.store(std::clamp(ground, 0.0f, 1.0f), std::memory_order_relaxed);
 }
 
 void video_model_mesh(const float* verts, int n, const uint8_t* rgba, int layers, int w, int h) {
