@@ -267,6 +267,7 @@ bool model_visible = false;
 std::vector<float> model_joints;                 // 3x4 rows per joint
 uint64_t model_joints_serial = 0;
 float model_camera[12];                          // the world's space to the camera's; all 0: none
+bool model_shown = false;                        // the last frame recorded it visible (its draws come before it)
 constexpr int kModelMaxVerts = 200000, kModelVertFloats = 20, kModelMaxJoints = 128;
 
 // The game's own lighting of a skinned model (its characters, its monsters), for a port's model: the
@@ -279,8 +280,9 @@ struct ModelLight {
     float amb[4], mat[4];
     int32_t info[4];                // lights, attenuation function, diffuse function, lit at all
     float col[8][4], pos[8][4], dir[8][4], cosatt[8][4], distatt[8][4];
+    float shade[4];                 // the scenery's light where it stands (probe_ground): all of it times this
 };
-static_assert(sizeof(ModelLight) == 688, "std140 layout");
+static_assert(sizeof(ModelLight) == 704, "std140 layout");
 ModelLight light_frame{}, light_world{};
 bool light_frame_ok = false, light_world_ok = false;
 float light_frame_d2 = 0.0f;                    // how far the frame's catch is from the model (squared)
@@ -328,6 +330,111 @@ void catch_light(const GVtx& v) {
     L.info[2] = (int32_t)(cc >> 7 & 3);
     L.info[3] = 1;
     light_frame_ok = true;
+}
+
+// The scenery's own light where a port's model stands. The game lights its characters with its lights
+// alone, but its scenery's light and shade are baked into the scenery's vertex colours: a character in
+// a dark corner is as bright as in the open. So the model is dimmed by the baked colour of the ground
+// straight under it: the nearest surface below its feet among the scenery's draws (unskinned, vertex-
+// coloured, unlit or lit by the ambient alone, one TEV stage of the texture times that colour), as the
+// draw lights and scales it. Its brightness against an open, sunlit ground's (kGroundRef) is the
+// model's shade, kept from kGroundMin to 1, eased as it moves; tuned by WIIKIT_MODEL_GROUND="ref,min".
+struct Ground { bool hit = false; float t = 0.0f, rgb[3] = {}; } ground_frame;
+float ground_shade = 1.0f;
+float kGroundRef = 0.8f, kGroundMin = 0.2f;
+
+void probe_ground(uint8_t prim, const uint8_t* pieces, uint32_t npieces) {
+    const float* c = model_camera;
+    float up[3] = {c[1], c[5], c[9]};                           // the world's up, in the camera's space
+    if (up[0] * up[0] + up[1] * up[1] + up[2] * up[2] < 0.5f) return;   // no camera yet
+    uint32_t env = bp[0xC0];                                    // stage 0: the texture times the colour
+    if ((env & 0xFFFF) != 0xF8AF || (env >> 16 & 7) != 0) return;     // (a 0, b TEXC, c RASC, d 0; add, no bias)
+    static const float scales[4] = {1.0f, 2.0f, 4.0f, 0.5f};
+    float scale = scales[env >> 20 & 3];
+    uint32_t cc = xf[0x100E];
+    float lit[3] = {1.0f, 1.0f, 1.0f};
+    if (cc >> 1 & 1) {                                          // lit by the ambient alone
+        float amb[4];
+        unpack_rgba(xf[0x100A], amb);
+        for (int k = 0; k < 3; ++k) lit[k] = std::min(amb[k], 1.0f);
+    }
+    const float o[3] = {model_view[3] + 60.0f * up[0], model_view[7] + 60.0f * up[1], model_view[11] + 60.0f * up[2]};
+    const float d[3] = {-up[0], -up[1], -up[2]};
+    static std::vector<float> vp;                              // a piece's corners: x y z r g b
+    const uint8_t* q = pieces;
+    for (uint32_t pc = 0; pc < npieces; ++pc) {
+        uint32_t n;
+        std::memcpy(&n, q, 4);
+        q += 4;
+        vp.resize((size_t)n * 6);
+        for (uint32_t i = 0; i < n; ++i) {
+            const uint8_t* v = q + (size_t)i * sizeof(GVtx);
+            float p[3];
+            uint8_t m, col[4];
+            std::memcpy(p, v + offsetof(GVtx, pos), sizeof p);
+            std::memcpy(&m, v + offsetof(GVtx, mtx), 1);
+            std::memcpy(col, v + offsetof(GVtx, col), 4);
+            uint32_t r = (uint32_t)m * 4;
+            for (int k = 0; k < 3; ++k) {
+                uint32_t a = std::min<uint32_t>(r + 4 * (uint32_t)k, 0xFC);
+                vp[i * 6 + k] = fx(a) * p[0] + fx(a + 1) * p[1] + fx(a + 2) * p[2] + fx(a + 3);
+                vp[i * 6 + 3 + k] = col[k] / 255.0f;
+            }
+        }
+        auto tri = [&](uint32_t ia, uint32_t ib, uint32_t ic) {    // Moller-Trumbore, the ray down
+            const float *A = &vp[ia * 6], *B = &vp[ib * 6], *C = &vp[ic * 6];
+            float e1[3] = {B[0] - A[0], B[1] - A[1], B[2] - A[2]}, e2[3] = {C[0] - A[0], C[1] - A[1], C[2] - A[2]};
+            float pv[3] = {d[1] * e2[2] - d[2] * e2[1], d[2] * e2[0] - d[0] * e2[2], d[0] * e2[1] - d[1] * e2[0]};
+            float det = e1[0] * pv[0] + e1[1] * pv[1] + e1[2] * pv[2];
+            if (std::fabs(det) < 1e-6f) return;
+            float inv = 1.0f / det, s[3] = {o[0] - A[0], o[1] - A[1], o[2] - A[2]};
+            float u = (s[0] * pv[0] + s[1] * pv[1] + s[2] * pv[2]) * inv;
+            if (u < 0.0f || u > 1.0f) return;
+            float qv[3] = {s[1] * e1[2] - s[2] * e1[1], s[2] * e1[0] - s[0] * e1[2], s[0] * e1[1] - s[1] * e1[0]};
+            float w = (d[0] * qv[0] + d[1] * qv[1] + d[2] * qv[2]) * inv;
+            if (w < 0.0f || u + w > 1.0f) return;
+            float t = (e2[0] * qv[0] + e2[1] * qv[1] + e2[2] * qv[2]) * inv;
+            if (t < 0.0f || t > 400.0f || (ground_frame.hit && t >= ground_frame.t)) return;
+            ground_frame.hit = true;
+            ground_frame.t = t;
+            for (int k = 0; k < 3; ++k)
+                ground_frame.rgb[k] = ((1.0f - u - w) * A[3 + k] + u * B[3 + k] + w * C[3 + k]) * lit[k] * scale;
+        };
+        switch (prim) {
+        case 0x80: case 0x88: for (uint32_t k = 0; k + 3 < n; k += 4) { tri(k, k + 1, k + 2); tri(k, k + 2, k + 3); } break;
+        case 0x90: for (uint32_t k = 0; k + 2 < n; k += 3) tri(k, k + 1, k + 2); break;
+        case 0x98: for (uint32_t k = 0; k + 2 < n; ++k) tri(k, k + 1, k + 2); break;
+        case 0xA0: for (uint32_t k = 1; k + 1 < n; ++k) tri(0, k, k + 1); break;
+        default: break;
+        }
+        q += (size_t)n * sizeof(GVtx);
+    }
+}
+
+// The frame's ground into the model's shade, eased; told now and then (the brightnesses it meets, for
+// tuning kGroundRef).
+float model_shade() {
+    static bool tuned = false;
+    if (!tuned) {
+        tuned = true;
+        if (const char* e = std::getenv("WIIKIT_MODEL_GROUND")) std::sscanf(e, "%f,%f", &kGroundRef, &kGroundMin);
+    }
+    if (ground_frame.hit) {
+        const float* g = ground_frame.rgb;
+        float lum = 0.299f * g[0] + 0.587f * g[1] + 0.114f * g[2];
+        float want = std::clamp(lum / kGroundRef, kGroundMin, 1.0f);
+        ground_shade += (want - ground_shade) * 0.15f;
+        static auto last = std::chrono::steady_clock::time_point{};
+        static float told = -1.0f;
+        auto now = std::chrono::steady_clock::now();
+        if (now - last > std::chrono::seconds(2) && std::fabs(lum - told) > 0.05f) {
+            last = now;
+            told = lum;
+            rt_log("video: the ground under a port's model: %.2f %.2f %.2f (brightness %.2f, shade %.2f)",
+                   g[0], g[1], g[2], lum, want);
+        }
+    }
+    return ground_shade;
 }
 
 // The frame's lights into the world's space (kept), or the kept ones into this camera's: what the
@@ -485,7 +592,7 @@ void draw_model() {
             "in float v_side;\n"
             "layout(std140, binding = 7) uniform Model { vec4 mv[3]; vec4 pr0; vec4 pr1; vec4 vp; };\n"
             "layout(std140, binding = 9) uniform Light { vec4 amb; vec4 mat; ivec4 info;\n"
-            "    vec4 lc[8]; vec4 lp[8]; vec4 ld[8]; vec4 lca[8]; vec4 lda[8]; };\n"
+            "    vec4 lc[8]; vec4 lp[8]; vec4 ld[8]; vec4 lca[8]; vec4 lda[8]; vec4 shade; };\n"
             "layout(binding = 15) uniform sampler2DArray tex;\n"
             "out vec4 col;\n"
             // GX's light: diffuse by the channel's function, attenuated (spot or specular), as gxshader
@@ -516,7 +623,7 @@ void draw_model() {
             "        for (int i = 0; i < info.x; ++i) acc += light(i, v_pos, n);\n"
             "        rgb *= mat.rgb * clamp(acc, 0.0, 1.0);\n"
             "    }\n"
-            "    col = vec4(rgb, 1.0);\n"
+            "    col = vec4(rgb * shade.rgb, 1.0);\n"
             "}\n");
         if (!prog) { model_visible = false; return; }
     }
@@ -529,6 +636,9 @@ void draw_model() {
     glNamedBufferSubData(ubo, 0, sizeof ub, ub);
     ModelLight lit{};                                          // (the renderer's alone: no lock)
     if (!model_light(lit)) lit = ModelLight{};                 // info.w 0: unlit, the textures as they are
+    float shade = model_shade();
+    for (int k = 0; k < 3; ++k) lit.shade[k] = shade;
+    lit.shade[3] = 1.0f;
     static bool told_light = false;
     if (lit.info[3] && !told_light) {
         told_light = true;
@@ -583,7 +693,8 @@ void efb_copy(uint32_t v) {
         {                                                        // each frame its own: a frame with no
             std::lock_guard<std::mutex> lk(model_mx);            // model recorded, or no 3D scene, shows none
             model_visible = false;
-            light_frame_ok = false;                              // and the lights it caught
+            light_frame_ok = false;                              // and the lights it caught,
+            ground_frame = Ground{};                             // and the ground under it
         }
         scene_vp.ok = false;
         glDisable(GL_SCISSOR_TEST);
@@ -758,6 +869,10 @@ void draw(uint8_t prim, uint8_t vflags, const uint8_t* pieces, uint32_t npieces)
         std::memcpy(&first, pieces + 4, sizeof first);
         catch_light(first);
     }
+    if (!(vflags & VTX_PNMTX) && (vflags & VTX_COL0) && tri && xf[0x1026] == 0 && (xf[0x1009] & 3) &&
+        (xf[0x100E] & 1) && (!(xf[0x100E] >> 1 & 1) || !((xf[0x100E] >> 2 & 15) | (xf[0x100E] >> 11 & 15))) &&
+        (bp[0x00] >> 10 & 15) == 0 && model_shown)
+        probe_ground(prim, pieces, npieces);                   // the scenery, its light baked: under the model?
     if (tri && cull == 3) return;
     vflags &= (uint8_t)~VTX_PNMTX;
     GLuint prog = program_for(vflags);
@@ -1007,6 +1122,7 @@ void exec(const std::vector<uint8_t>& data) {
             p += (size_t)n * 12 * 4;
             ++model_joints_serial;
             model_visible = vis;
+            model_shown = vis;
             break;
         }
         default: rt_die("video: bad record byte %02X", p[-1]);
