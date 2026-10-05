@@ -337,7 +337,8 @@ void catch_light(const GVtx& v) {
 // a dark corner is as bright as in the open. So the model is dimmed by the baked colour of the ground
 // straight under it: the nearest surface below its feet among the scenery's draws (unskinned, vertex-
 // coloured, unlit or lit by the ambient alone, one TEV stage of the texture times that colour, solid:
-// not a blended overlay or cut-out grass), as the draw lights and scales it. Its brightness against an open, sunlit ground's (kGroundRef) is the
+// not a blended overlay; a cut-out one counts whole, as a boardwalk's planks, not the water through
+// their gaps), as the draw lights and scales it. Its brightness against an open, sunlit ground's (kGroundRef) is the
 // model's shade, kept from kGroundMin to 1, eased as it moves; tuned by WIIKIT_MODEL_GROUND="ref,min".
 struct Ground { bool hit = false; float t = 0.0f, rgb[3] = {}; } ground_frame;
 float ground_shade = 1.0f;
@@ -871,8 +872,8 @@ void draw(uint8_t prim, uint8_t vflags, const uint8_t* pieces, uint32_t npieces)
     }
     if (!(vflags & VTX_PNMTX) && (vflags & VTX_COL0) && tri && xf[0x1026] == 0 && (xf[0x1009] & 3) &&
         (xf[0x100E] & 1) && (!(xf[0x100E] >> 1 & 1) || !((xf[0x100E] >> 2 & 15) | (xf[0x100E] >> 11 & 15))) &&
-        (bp[0x00] >> 10 & 15) == 0 && !(bp[0x41] & 1) && (bp[0x40] >> 4 & 1) && (bp[0xF3] >> 16 & 0x3F) == 0x3F &&
-        model_shown)                                           // (solid: no blending, depth written, no cut-out)
+        (bp[0x00] >> 10 & 15) == 0 && !(bp[0x41] & 1) && (bp[0x40] >> 4 & 1) &&
+        model_shown)                                           // (solid: no blending, depth written)
         probe_ground(prim, pieces, npieces);                   // the scenery, its light baked: under the model?
     if (tri && cull == 3) return;
     vflags &= (uint8_t)~VTX_PNMTX;
