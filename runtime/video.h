@@ -19,8 +19,8 @@
 //   FRAME   (an XFB copy was recorded: one frame)
 //   DRAWDONE (the game asked to know when the GP has drawn everything so
 //            far: the renderer, reaching it, raises PE's finish interrupt)
-//   MODEL   u8 visible, u16 n, 12 f32 view, 6 f32 projection, n x 12 f32
-//           joints: a port's model as this frame shows it (video_model_frame)
+//   MODEL   u8 visible, u16 n, 12 f32 view, 6 f32 projection, 12 f32 camera,
+//           n x 12 f32 joints: a port's model as this frame shows it (video_model_frame)
 #pragma once
 #include <atomic>
 #include <cstdint>
@@ -37,7 +37,8 @@ struct GVtx {
 static_assert(sizeof(GVtx) == 132, "GVtx layout");
 
 enum : uint8_t { VC_BP = 1, VC_XF, VC_DRAW, VC_TEXUP, VC_TEXBIND, VC_TEXEFB, VC_FRAME, VC_DRAWDONE, VC_MODEL };
-enum : uint8_t { VTX_COL0 = 1, VTX_COL1 = 2, VTX_NRM = 4, VTX_NBT = 8 };
+// VTX_PNMTX: each vertex picks its position matrix (a skinned model); not a shader's concern
+enum : uint8_t { VTX_COL0 = 1, VTX_COL1 = 2, VTX_NRM = 4, VTX_NBT = 8, VTX_PNMTX = 16 };
 
 // video.cpp
 bool video_enabled();                       // false with --no-video: the stream is parsed only
@@ -114,11 +115,16 @@ void video_overlay_update(const uint8_t* rgba, int w, int h);
 // A port's 3D model, drawn into the game's scene just before each frame is
 // copied out for display, depth-tested against it with the scene's own
 // projection and viewport, skinned on its joints. Any thread may call these.
-// verts: n triangle corners of 13 floats: p0 x y z, p1 x y z, joint 0, joint 1
-// (-1: none), weight 0, weight 1, u v layer. A corner is at
-// J0 (p0, w0) + J1 (p1, w1): each position in its joint's space, already
-// weighted (J (p, w) = R p + w t). rgba: layers textures of w x h each,
-// stacked top to bottom; UVs wrap.
+// verts: n triangle corners of 20 floats: p0 x y z, p1 x y z, joint 0, joint 1
+// (-1: none), weight 0, weight 1, u v layer, n0 x y z, n1 x y z, two-sided.
+// A corner is at J0 (p0, w0) + J1 (p1, w1): each position in its joint's
+// space, already weighted (J (p, w) = R p + w t); its normal R0 n0 + R1 n1.
+// Two-sided (1): lit on the side seen (cloth). rgba: layers textures of
+// w x h each, stacked top to bottom; UVs wrap. It is lit as the game lights
+// its own skinned models (its characters): with the lights of the last one
+// drawn in the frame, or, in a frame with none, the last ones seen, kept
+// where they were in the world (by the camera, video_model_frame). Unlit
+// until the game has drawn one.
 void video_model_mesh(const float* verts, int n, const uint8_t* rgba, int layers, int w, int h);
 // fn is called on the game's thread as each frame is done (the XFB copy, as
 // the game asks for it), before that copy is recorded: the moment the
@@ -128,9 +134,11 @@ void video_set_frame_hook(void (*fn)());
 // the frame's draws so that the renderer, however far behind the game, draws
 // it with the frame it belongs to. view: the model's space to the camera's
 // (3x4, rows); proj: GX's six perspective parameters (XF 0x1020-0x1025);
-// joints: n (at most 128) 3x4 matrices, rows, in the model's space. Not drawn
-// in a frame that records none, or visible false.
-void video_model_frame(const float view[12], const float proj[6], bool visible, const float* joints, int n);
+// joints: n (at most 128) 3x4 matrices, rows, in the model's space; camera:
+// the world's space to the camera's (3x4, rows; null: none). Not drawn in a
+// frame that records none, or visible false.
+void video_model_frame(const float view[12], const float proj[6], bool visible, const float* joints, int n,
+                       const float* camera = nullptr);
 
 // WIIKIT_PERF=1: where a frame's time goes, reported every second by the
 // renderer. Nanoseconds, summed since the last report.

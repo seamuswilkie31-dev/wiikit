@@ -266,7 +266,96 @@ float model_view[12], model_proj[6];
 bool model_visible = false;
 std::vector<float> model_joints;                 // 3x4 rows per joint
 uint64_t model_joints_serial = 0;
-constexpr int kModelMaxVerts = 200000, kModelVertFloats = 13, kModelMaxJoints = 128;
+float model_camera[12];                          // the world's space to the camera's; all 0: none
+constexpr int kModelMaxVerts = 200000, kModelVertFloats = 20, kModelMaxJoints = 128;
+
+// The game's own lighting of a skinned model (its characters, its monsters), for a port's model: the
+// last one drawn in the frame (XF's lights as it drew, in the camera's space), and the same kept in the
+// world's space for a frame that draws none. GX's lighting: the material times the ambient plus each
+// light (its colour, by the diffuse and attenuation functions the channel picks). As the std140 block
+// the model's shader reads (binding 9). The renderer thread's alone, as the records it replays.
+struct ModelLight {
+    float amb[4], mat[4];
+    int32_t info[4];                // lights, attenuation function, diffuse function, lit at all
+    float col[8][4], pos[8][4], dir[8][4], cosatt[8][4], distatt[8][4];
+};
+static_assert(sizeof(ModelLight) == 688, "std140 layout");
+ModelLight light_frame{}, light_world{};
+bool light_frame_ok = false, light_world_ok = false;
+bool light_follows_camera[8] = {};              // in the camera's space wherever it looks (a light from the viewer)
+
+void unpack_rgba(uint32_t c, float* o) {
+    for (int i = 0; i < 4; ++i) o[i] = (float)(c >> (24 - 8 * i) & 255) / 255.0f;
+}
+
+// A skinned, lit draw: its channel's lights, as the model's to be.
+void catch_light() {
+    uint32_t cc = xf[0x100E];
+    uint32_t mask = (cc >> 2 & 15) | (cc >> 11 & 15) << 4;
+    if (!mask) return;
+    ModelLight& L = light_frame;
+    L = ModelLight{};
+    unpack_rgba(xf[0x100A], L.amb);
+    if (cc & 1) for (float& m : L.mat) m = 1.0f;                // the vertex's colour: white here
+    else unpack_rgba(xf[0x100C], L.mat);
+    int n = 0;
+    for (int i = 0; i < 8; ++i) {
+        if (!(mask >> i & 1)) continue;
+        uint32_t b = 0x600 + 16 * (uint32_t)i;
+        unpack_rgba(xf[b + 3], L.col[n]);
+        for (int k = 0; k < 3; ++k) {
+            L.cosatt[n][k] = fx(b + 4 + k);
+            L.distatt[n][k] = fx(b + 7 + k);
+            L.pos[n][k] = fx(b + 10 + k);
+            L.dir[n][k] = fx(b + 13 + k);
+        }
+        ++n;
+    }
+    L.info[0] = n;
+    L.info[1] = (int32_t)(cc >> 9 & 3);
+    L.info[2] = (int32_t)(cc >> 7 & 3);
+    L.info[3] = 1;
+    light_frame_ok = true;
+}
+
+// The frame's lights into the world's space (kept), or the kept ones into this camera's: what the
+// model is lit by now. False: unlit (no camera, or no skinned model drawn yet).
+bool model_light(ModelLight& out) {
+    const float* c = model_camera;
+    bool cam = false;
+    for (int i = 0; i < 12; ++i) cam |= c[i] != 0.0f;
+    if (!cam) return false;
+    auto to_world = [&](const float* v, float* o, bool point) {          // R^T (v - t)
+        float d[3] = {v[0] - (point ? c[3] : 0), v[1] - (point ? c[7] : 0), v[2] - (point ? c[11] : 0)};
+        for (int k = 0; k < 3; ++k) o[k] = c[k] * d[0] + c[4 + k] * d[1] + c[8 + k] * d[2];
+    };
+    auto to_view = [&](const float* v, float* o, bool point) {           // R v + t
+        for (int k = 0; k < 3; ++k)
+            o[k] = c[4 * k] * v[0] + c[4 * k + 1] * v[1] + c[4 * k + 2] * v[2] + (point ? c[4 * k + 3] : 0);
+    };
+    if (light_frame_ok) {
+        light_world = light_frame;
+        for (int i = 0; i < light_frame.info[0]; ++i) {
+            const float* p = light_frame.pos[i];
+            float len = std::sqrt(p[0] * p[0] + p[1] * p[1] + p[2] * p[2]);
+            light_follows_camera[i] = len > 1e5f && p[2] > 0.995f * len;   // far, straight from the viewer
+            if (light_follows_camera[i]) continue;
+            to_world(light_frame.pos[i], light_world.pos[i], true);
+            to_world(light_frame.dir[i], light_world.dir[i], false);
+        }
+        light_world_ok = true;
+        out = light_frame;
+        return true;
+    }
+    if (!light_world_ok) return false;
+    out = light_world;
+    for (int i = 0; i < light_world.info[0]; ++i) {
+        if (light_follows_camera[i]) continue;
+        to_view(light_world.pos[i], out.pos[i], true);
+        to_view(light_world.dir[i], out.dir[i], false);
+    }
+    return true;
+}
 
 // Into the EFB before it goes to the XFB: depth-tested against the scene, with
 // GX's projection and the scene's viewport, as gxshader's own draws. Its own
@@ -274,7 +363,7 @@ constexpr int kModelMaxVerts = 200000, kModelVertFloats = 13, kModelMaxJoints = 
 // game's draws set everything else themselves. Skinned here: each vertex on
 // one joint or two (video_model_mesh), the joints as the port last posed them.
 void draw_model() {
-    static GLuint prog = 0, vbuf = 0, mvao = 0, tex = 0, ubo = 0, jubo = 0;
+    static GLuint prog = 0, vbuf = 0, mvao = 0, tex = 0, ubo = 0, jubo = 0, lubo = 0;
     static uint64_t shown = 0, joints_shown = 0;
     static int n = 0, layers = 1;
     float ub[24];
@@ -288,11 +377,14 @@ void draw_model() {
             glNamedBufferStorage(ubo, sizeof ub, nullptr, GL_DYNAMIC_STORAGE_BIT);
             glCreateBuffers(1, &jubo);
             glNamedBufferStorage(jubo, kModelMaxJoints * 12 * 4, nullptr, GL_DYNAMIC_STORAGE_BIT);
+            glCreateBuffers(1, &lubo);
+            glNamedBufferStorage(lubo, sizeof(ModelLight), nullptr, GL_DYNAMIC_STORAGE_BIT);
             glCreateVertexArrays(1, &mvao);
             glVertexArrayVertexBuffer(mvao, 0, vbuf, 0, kModelVertFloats * 4);
-            const GLint size[4] = {3, 3, 4, 3};                  // p0, p1, joints and weights, u v layer
-            const GLuint at[4] = {0, 12, 24, 40};
-            for (GLuint a = 0; a < 4; ++a) {
+            // p0, p1, joints and weights, u v layer, n0, n1, two-sided
+            const GLint size[7] = {3, 3, 4, 3, 3, 3, 1};
+            const GLuint at[7] = {0, 12, 24, 40, 52, 64, 76};
+            for (GLuint a = 0; a < 7; ++a) {
                 glEnableVertexArrayAttrib(mvao, a);
                 glVertexArrayAttribFormat(mvao, a, size[a], GL_FLOAT, GL_FALSE, at[a]);
                 glVertexArrayAttribBinding(mvao, a, 0);
@@ -339,9 +431,18 @@ void draw_model() {
             "layout(location = 1) in vec3 a_p1;\n"
             "layout(location = 2) in vec4 a_jw;\n"                 // joint 0, joint 1 (-1: none), their weights
             "layout(location = 3) in vec3 a_uvl;\n"
+            "layout(location = 4) in vec3 a_n0;\n"
+            "layout(location = 5) in vec3 a_n1;\n"
+            "layout(location = 6) in float a_side;\n"
             "layout(std140, binding = 7) uniform Model { vec4 mv[3]; vec4 pr0; vec4 pr1; vec4 vp; };\n"
             "layout(std140, binding = 8) uniform Joints { vec4 jm[384]; };\n"
             "out vec3 uvl;\n"
+            "out vec3 v_pos;\n"
+            "out vec3 v_nrm;\n"
+            "out float v_side;\n"
+            "vec3 turn(int j, vec3 n) {\n"
+            "    return vec3(dot(jm[3 * j].xyz, n), dot(jm[3 * j + 1].xyz, n), dot(jm[3 * j + 2].xyz, n));\n"
+            "}\n"
             // a joint's rows on a position already weighted: its turn, its offset by the weight
             "vec3 on(int j, vec3 q, float w) {\n"
             "    vec4 h = vec4(q, w);\n"
@@ -353,6 +454,11 @@ void draw_model() {
             "    if (j1 >= 0) m += on(j1, a_p1, a_jw.w);\n"
             "    vec4 p = vec4(m, 1.0);\n"
             "    vec3 pos = vec3(dot(mv[0], p), dot(mv[1], p), dot(mv[2], p));\n"
+            "    vec3 nm = turn(j0, a_n0);\n"
+            "    if (j1 >= 0) nm += turn(j1, a_n1);\n"
+            "    v_nrm = vec3(dot(mv[0].xyz, nm), dot(mv[1].xyz, nm), dot(mv[2].xyz, nm));\n"
+            "    v_pos = pos;\n"
+            "    v_side = a_side;\n"
             "    vec4 clip = vec4(pr0.x * pos.x + pr0.y * pos.z, pr0.z * pos.y + pr0.w * pos.z, pr1.x * pos.z + pr1.y, -pos.z);\n"
             "    clip.z = clip.w * vp.x + clip.z * vp.y;\n"            // as gxshader: GX's depth range
             "    if (vp.z < 0.0) clip.x = -clip.x;\n"
@@ -362,13 +468,43 @@ void draw_model() {
             "}\n",
             "#version 450\n"
             "in vec3 uvl;\n"
+            "in vec3 v_pos;\n"
+            "in vec3 v_nrm;\n"
+            "in float v_side;\n"
             "layout(std140, binding = 7) uniform Model { vec4 mv[3]; vec4 pr0; vec4 pr1; vec4 vp; };\n"
+            "layout(std140, binding = 9) uniform Light { vec4 amb; vec4 mat; ivec4 info;\n"
+            "    vec4 lc[8]; vec4 lp[8]; vec4 ld[8]; vec4 lca[8]; vec4 lda[8]; };\n"
             "layout(binding = 15) uniform sampler2DArray tex;\n"
             "out vec4 col;\n"
+            // GX's light: diffuse by the channel's function, attenuated (spot or specular), as gxshader
+            "vec3 light(int i, vec3 pos, vec3 nrm) {\n"
+            "    vec3 t = lp[i].xyz - pos;\n"
+            "    vec3 l = dot(t, t) > 0.0 ? normalize(t) : nrm;\n"
+            "    float attn = 1.0;\n"
+            "    if (info.y == 3) {\n"
+            "        float d2 = dot(t, t), d = sqrt(d2), a = max(0.0, dot(l, ld[i].xyz));\n"
+            "        attn = max(0.0, lca[i].x + lca[i].y * a + lca[i].z * a * a) / max(dot(lda[i].xyz, vec3(1.0, d, d2)), 1e-6);\n"
+            "    } else if (info.y == 1) {\n"
+            "        float a = dot(nrm, l) >= 0.0 ? max(0.0, dot(nrm, ld[i].xyz)) : 0.0;\n"
+            "        vec3 k = info.z == 0 ? lda[i].xyz : normalize(lda[i].xyz);\n"
+            "        attn = max(0.0, dot(lca[i].xyz, vec3(1.0, a, a * a))) / max(dot(k, vec3(1.0, a, a * a)), 1e-6);\n"
+            "    }\n"
+            "    float df = info.z == 0 ? 1.0 : info.z == 1 ? dot(l, nrm) : max(0.0, dot(l, nrm));\n"
+            "    return attn * df * lc[i].rgb;\n"
+            "}\n"
             "void main() {\n"
             "    vec4 c = texture(tex, uvl);\n"                       // u, v, the layer
             "    if (c.a < 0.5) discard;\n"
-            "    col = vec4(c.rgb, 1.0);\n"
+            "    vec3 rgb = c.rgb;\n"
+            "    if (info.w != 0) {\n"                                // lit as the game lights its characters
+            "        float n2 = dot(v_nrm, v_nrm);\n"
+            "        vec3 n = n2 > 1e-12 ? v_nrm * inversesqrt(n2) : normalize(-v_pos);\n"
+            "        if (v_side > 0.5 && dot(n, v_pos) > 0.0) n = -n;\n"   // cloth: the side seen
+            "        vec3 acc = amb.rgb;\n"
+            "        for (int i = 0; i < info.x; ++i) acc += light(i, v_pos, n);\n"
+            "        rgb *= mat.rgb * clamp(acc, 0.0, 1.0);\n"
+            "    }\n"
+            "    col = vec4(rgb, 1.0);\n"
             "}\n");
         if (!prog) { model_visible = false; return; }
     }
@@ -379,8 +515,18 @@ void draw_model() {
                n, layers, scene_vp.x, scene_vp.y, scene_vp.w, scene_vp.h, ub[20], ub[21], ub[22], ub[23]);
     }
     glNamedBufferSubData(ubo, 0, sizeof ub, ub);
+    ModelLight lit{};                                          // (the renderer's alone: no lock)
+    if (!model_light(lit)) lit = ModelLight{};                 // info.w 0: unlit, the textures as they are
+    static bool told_light = false;
+    if (lit.info[3] && !told_light) {
+        told_light = true;
+        rt_log("video: a port's model lit as the game's characters: ambient %.2f %.2f %.2f, %d lights",
+               lit.amb[0], lit.amb[1], lit.amb[2], lit.info[0]);
+    }
+    glNamedBufferSubData(lubo, 0, sizeof lit, &lit);
     glBindBufferBase(GL_UNIFORM_BUFFER, 7, ubo);
     glBindBufferBase(GL_UNIFORM_BUFFER, 8, jubo);
+    glBindBufferBase(GL_UNIFORM_BUFFER, 9, lubo);
     glBindFramebuffer(GL_FRAMEBUFFER, efb_fbo);
     glViewportIndexedf(0, scene_vp.x, scene_vp.y, scene_vp.w, scene_vp.h);
     glDisable(GL_SCISSOR_TEST);
@@ -425,6 +571,7 @@ void efb_copy(uint32_t v) {
         {                                                        // each frame its own: a frame with no
             std::lock_guard<std::mutex> lk(model_mx);            // model recorded, or no 3D scene, shows none
             model_visible = false;
+            light_frame_ok = false;                              // and the lights it caught
         }
         scene_vp.ok = false;
         glDisable(GL_SCISSOR_TEST);
@@ -593,7 +740,10 @@ void draw(uint8_t prim, uint8_t vflags, const uint8_t* pieces, uint32_t npieces)
     }
     uint32_t cull = bp[0x00] >> 14 & 3;
     bool tri = prim < 0xA8;
+    if ((vflags & VTX_PNMTX) && (vflags & VTX_NRM) && xf[0x1026] == 0 && (xf[0x1009] & 3) && (xf[0x100E] >> 1 & 1))
+        catch_light();                                         // a skinned, lit model: a character's lights
     if (tri && cull == 3) return;
+    vflags &= (uint8_t)~VTX_PNMTX;
     GLuint prog = program_for(vflags);
     if (!prog) return;
     ++cnt.draws;
@@ -835,6 +985,8 @@ void exec(const std::vector<uint8_t>& data) {
             std::memcpy(model_view, p, sizeof model_view);
             std::memcpy(model_proj, p + sizeof model_view, sizeof model_proj);
             p += sizeof model_view + sizeof model_proj;
+            std::memcpy(model_camera, p, sizeof model_camera);
+            p += sizeof model_camera;
             model_joints.assign(reinterpret_cast<const float*>(p), reinterpret_cast<const float*>(p) + (size_t)n * 12);
             p += (size_t)n * 12 * 4;
             ++model_joints_serial;

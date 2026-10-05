@@ -394,7 +394,7 @@ const uint8_t* fetch(uint32_t mode, int arr, int size, const uint8_t*& p, uint32
 uint8_t decode_vertices(const VtxFmt& f, const uint8_t* p, uint32_t count, GVtx* out) {
     uint32_t pos = f.lo >> 9 & 3, nrm = f.lo >> 11 & 3, col[2] = {f.lo >> 13 & 3, f.lo >> 15 & 3};
     uint8_t flags = (col[0] ? VTX_COL0 : 0) | (col[1] ? VTX_COL1 : 0) | (nrm ? VTX_NRM : 0) |
-                    (nrm && f.nbt ? VTX_NBT : 0);
+                    (nrm && f.nbt ? VTX_NBT : 0) | (f.lo & 1 ? VTX_PNMTX : 0);
     int nsz = fmt_size(f.nrm_fmt);
     for (uint32_t k = 0; k < count; ++k) {
         GVtx& v = out[k];
@@ -636,7 +636,8 @@ void gx_trace_next_frame() { trace_next = true; }
 
 void video_set_frame_hook(void (*fn)()) { frame_hook = fn; }
 
-void video_model_frame(const float view[12], const float proj[6], bool visible, const float* joints, int n) {
+void video_model_frame(const float view[12], const float proj[6], bool visible, const float* joints, int n,
+                       const float* camera) {
     if (!video) return;
     n = std::clamp(n, 0, 128);
     put<uint8_t>(VC_MODEL);
@@ -644,6 +645,8 @@ void video_model_frame(const float view[12], const float proj[6], bool visible, 
     put<uint16_t>((uint16_t)n);
     std::memcpy(grow(12 * 4), view, 12 * 4);
     std::memcpy(grow(6 * 4), proj, 6 * 4);
+    float* cam = reinterpret_cast<float*>(grow(12 * 4));          // none: zeros
+    for (int i = 0; i < 12; ++i) cam[i] = camera ? camera[i] : 0.0f;
     if (n) std::memcpy(grow((size_t)n * 12 * 4), joints, (size_t)n * 12 * 4);
 }
 
