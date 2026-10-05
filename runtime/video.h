@@ -140,9 +140,10 @@ void video_set_frame_hook(void (*fn)());
 void video_model_frame(const float view[12], const float proj[6], bool visible, const float* joints, int n,
                        const float* camera = nullptr);
 // How the model is shaded. gain: how bright its textures are under the game's light (lit, each texel
-// times the light times gain; 1: as the game's own, 2: textures made for twice the light, as FFXI's).
-// ground: how much the scenery's baked light under it dims it (0: not at all, as the game's own
-// characters; 1: as dark as the ground). Any thread; 1 and 0 at first.
+// times the light times gain; 1: as the game's own, 2: textures made for twice the light, as FFXI's;
+// 0: not lit at all, its textures as they are). ground: how much the scenery's baked light under it
+// dims it (0: not at all, as the game's own characters; 1: as dark as the ground). Any thread; 0 and
+// 0 at first: unlit.
 void video_model_shading(float gain, float ground);
 
 // WIIKIT_PERF=1: where a frame's time goes, reported every second by the

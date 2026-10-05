@@ -343,7 +343,7 @@ void catch_light(const GVtx& v) {
 struct Ground { bool hit = false; float t = 0.0f, rgb[3] = {}; } ground_frame;
 float ground_shade = 1.0f;
 float kGroundRef = 0.8f, kGroundMin = 0.2f;
-std::atomic<float> model_gain{1.0f}, model_ground{0.0f};   // video_model_shading
+std::atomic<float> model_gain{0.0f}, model_ground{0.0f};   // video_model_shading (0: unlit)
 
 void probe_ground(uint8_t prim, const uint8_t* pieces, uint32_t npieces) {
     const float* c = model_camera;
@@ -637,9 +637,10 @@ void draw_model() {
     }
     glNamedBufferSubData(ubo, 0, sizeof ub, ub);
     ModelLight lit{};                                          // (the renderer's alone: no lock)
-    if (!model_light(lit)) lit = ModelLight{};                 // info.w 0: unlit, the textures as they are
+    float gain = model_gain.load(std::memory_order_relaxed);
+    if (!model_light(lit) || gain <= 0.0f) lit = ModelLight{};  // info.w 0: unlit, the textures as they are
     float ground = model_ground.load(std::memory_order_relaxed);
-    float shade = (1.0f + (model_shade() - 1.0f) * ground) * (lit.info[3] ? model_gain.load(std::memory_order_relaxed) : 1.0f);
+    float shade = (1.0f + (model_shade() - 1.0f) * ground) * (lit.info[3] ? gain : 1.0f);
     for (int k = 0; k < 3; ++k) lit.shade[k] = shade;
     lit.shade[3] = 1.0f;
     static bool told_light = false;
@@ -1932,7 +1933,7 @@ void video_take_mouse_motion(float& dx, float& dy) {
 }
 
 void video_model_shading(float gain, float ground) {
-    model_gain.store(std::clamp(gain, 0.1f, 8.0f), std::memory_order_relaxed);
+    model_gain.store(gain > 0.0f ? std::clamp(gain, 0.1f, 8.0f) : 0.0f, std::memory_order_relaxed);
     model_ground.store(std::clamp(ground, 0.0f, 1.0f), std::memory_order_relaxed);
 }
 
