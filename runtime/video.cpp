@@ -270,8 +270,9 @@ float model_camera[12];                          // the world's space to the cam
 constexpr int kModelMaxVerts = 200000, kModelVertFloats = 20, kModelMaxJoints = 128;
 
 // The game's own lighting of a skinned model (its characters, its monsters), for a port's model: the
-// last one drawn in the frame (XF's lights as it drew, in the camera's space), and the same kept in the
-// world's space for a frame that draws none. GX's lighting: the material times the ambient plus each
+// frame's nearest to it (XF's lights as it drew, in the camera's space; the lights only, not its
+// material's colour, which is that model's own), and the same kept in the world's space for a frame
+// that draws none. GX's lighting: the material times the ambient plus each
 // light (its colour, by the diffuse and attenuation functions the channel picks). As the std140 block
 // the model's shader reads (binding 9). The renderer thread's alone, as the records it replays.
 struct ModelLight {
@@ -282,22 +283,33 @@ struct ModelLight {
 static_assert(sizeof(ModelLight) == 688, "std140 layout");
 ModelLight light_frame{}, light_world{};
 bool light_frame_ok = false, light_world_ok = false;
+float light_frame_d2 = 0.0f;                    // how far the frame's catch is from the model (squared)
 bool light_follows_camera[8] = {};              // in the camera's space wherever it looks (a light from the viewer)
 
 void unpack_rgba(uint32_t c, float* o) {
     for (int i = 0; i < 4; ++i) o[i] = (float)(c >> (24 - 8 * i) & 255) / 255.0f;
 }
 
-// A skinned, lit draw: its channel's lights, as the model's to be.
-void catch_light() {
+// A skinned, lit draw (v: its first vertex): its channel's lights, as the model's to be, if it is the
+// frame's nearest yet to where the model last was (a villager by a forge across the village is not).
+void catch_light(const GVtx& v) {
     uint32_t cc = xf[0x100E];
     uint32_t mask = (cc >> 2 & 15) | (cc >> 11 & 15) << 4;
-    if (!mask) return;
+    if (!mask || (cc >> 6 & 1)) return;                         // no lights, or the ambient its vertices'
+    uint32_t m = (uint32_t)v.mtx[0] * 4;                        // the vertex in the camera's space
+    float d2 = 0.0f;
+    for (int k = 0; k < 3 && m + 4 * k + 3 < 0x100; ++k) {
+        uint32_t r = m + 4 * (uint32_t)k;
+        float c = fx(r) * v.pos[0] + fx(r + 1) * v.pos[1] + fx(r + 2) * v.pos[2] + fx(r + 3);
+        float d = c - model_view[4 * k + 3];
+        d2 += d * d;
+    }
+    if (light_frame_ok && d2 >= light_frame_d2) return;
+    light_frame_d2 = d2;
     ModelLight& L = light_frame;
     L = ModelLight{};
     unpack_rgba(xf[0x100A], L.amb);
-    if (cc & 1) for (float& m : L.mat) m = 1.0f;                // the vertex's colour: white here
-    else unpack_rgba(xf[0x100C], L.mat);
+    for (float& c : L.mat) c = 1.0f;                            // the light, not the model's own colour
     int n = 0;
     for (int i = 0; i < 8; ++i) {
         if (!(mask >> i & 1)) continue;
@@ -740,8 +752,12 @@ void draw(uint8_t prim, uint8_t vflags, const uint8_t* pieces, uint32_t npieces)
     }
     uint32_t cull = bp[0x00] >> 14 & 3;
     bool tri = prim < 0xA8;
-    if ((vflags & VTX_PNMTX) && (vflags & VTX_NRM) && xf[0x1026] == 0 && (xf[0x1009] & 3) && (xf[0x100E] >> 1 & 1))
-        catch_light();                                         // a skinned, lit model: a character's lights
+    if ((vflags & VTX_PNMTX) && (vflags & VTX_NRM) && xf[0x1026] == 0 && (xf[0x1009] & 3) && (xf[0x100E] >> 1 & 1)) {
+        GVtx first;                                            // a skinned, lit model: a character's lights
+                                                               // (the record's bytes need not be aligned)
+        std::memcpy(&first, pieces + 4, sizeof first);
+        catch_light(first);
+    }
     if (tri && cull == 3) return;
     vflags &= (uint8_t)~VTX_PNMTX;
     GLuint prog = program_for(vflags);
