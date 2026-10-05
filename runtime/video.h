@@ -21,6 +21,8 @@
 //            far: the renderer, reaching it, raises PE's finish interrupt)
 //   MODEL   u8 visible, u16 n, 12 f32 view, 6 f32 projection, 12 f32 camera,
 //           n x 12 f32 joints: a port's model as this frame shows it (video_model_frame)
+//   FX      5 u32 counts, 12 f32 view, 6 f32 projection, the corners (10 f32
+//           each): a port's effects as this frame shows them (video_fx_frame)
 #pragma once
 #include <atomic>
 #include <cstdint>
@@ -36,7 +38,7 @@ struct GVtx {
 };
 static_assert(sizeof(GVtx) == 132, "GVtx layout");
 
-enum : uint8_t { VC_BP = 1, VC_XF, VC_DRAW, VC_TEXUP, VC_TEXBIND, VC_TEXEFB, VC_FRAME, VC_DRAWDONE, VC_MODEL };
+enum : uint8_t { VC_BP = 1, VC_XF, VC_DRAW, VC_TEXUP, VC_TEXBIND, VC_TEXEFB, VC_FRAME, VC_DRAWDONE, VC_MODEL, VC_FX };
 // VTX_PNMTX: each vertex picks its position matrix (a skinned model); not a shader's concern
 enum : uint8_t { VTX_COL0 = 1, VTX_COL1 = 2, VTX_NRM = 4, VTX_NBT = 8, VTX_PNMTX = 16 };
 
@@ -145,6 +147,19 @@ void video_model_frame(const float view[12], const float proj[6], bool visible, 
 // dims it (0: not at all, as the game's own characters; 1: as dark as the ground). Any thread; 0 and
 // 0 at first: unlit.
 void video_model_shading(float gain, float ground);
+
+// A port's effects (particles: a spell's light, a hit's sparks), drawn into
+// the game's scene after its model, depth-tested against it and not
+// writing depth, blended. Textures: layers RGBA images of w x h, stacked;
+// any thread may hand them over (the renderer copies them). From the frame
+// hook only, the frame's triangles: their corners in the world, 10 floats
+// each (x y z, u v, the texture layer (-1: none; +1000: its alpha read as
+// half), r g b a, the texel multiplied by them, as many as 4 times over),
+// counts[5] of them, in order, blended as opaque, by alpha, added,
+// subtracted, darkening; view and proj as video_model_frame's. Not drawn in
+// a frame that records none.
+void video_fx_textures(const uint8_t* rgba, int layers, int w, int h);
+void video_fx_frame(const float view[12], const float proj[6], const float* corners, const uint32_t counts[5]);
 
 // WIIKIT_PERF=1: where a frame's time goes, reported every second by the
 // renderer. Nanoseconds, summed since the last report.

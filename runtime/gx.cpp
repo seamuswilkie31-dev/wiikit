@@ -650,6 +650,17 @@ void video_model_frame(const float view[12], const float proj[6], bool visible, 
     if (n) std::memcpy(grow((size_t)n * 12 * 4), joints, (size_t)n * 12 * 4);
 }
 
+void video_fx_frame(const float view[12], const float proj[6], const float* corners, const uint32_t counts[5]) {
+    if (!video) return;
+    uint32_t n = 0;
+    for (int i = 0; i < 5; ++i) n += counts[i];
+    put<uint8_t>(VC_FX);
+    for (int i = 0; i < 5; ++i) put<uint32_t>(counts[i]);
+    std::memcpy(grow(12 * 4), view, 12 * 4);
+    std::memcpy(grow(6 * 4), proj, 6 * 4);
+    if (n) std::memcpy(grow((size_t)n * 10 * 4), corners, (size_t)n * 10 * 4);
+}
+
 // The EFB as the CPU reads it: 0xC8000000 | y << 12 | x << 2, bit 22 for Z
 // (GXPeekARGB, GXPeekZ; a game reads the picture's brightness so). The
 // record so far is handed over, and the renderer reads the EFB back once it

@@ -345,6 +345,17 @@ float ground_shade = 1.0f;
 float kGroundRef = 0.8f, kGroundMin = 0.2f;
 std::atomic<float> model_gain{0.0f}, model_ground{0.0f};   // video_model_shading (0: unlit)
 
+// A port's effects: their textures (any thread hands them over: fx_mx), and the frame's triangles as
+// recorded (the renderer's own, replayed and drawn on its thread).
+std::mutex fx_mx;
+std::vector<uint8_t> fx_tex;
+int fx_layers = 0, fx_tw = 0, fx_th = 0;
+uint64_t fx_tex_serial = 0;
+std::vector<float> fx_corners;
+uint32_t fx_counts[5] = {};
+float fx_view[12], fx_proj[6];
+bool fx_shown = false;
+
 void probe_ground(uint8_t prim, const uint8_t* pieces, uint32_t npieces) {
     const float* c = model_camera;
     float up[3] = {c[1], c[5], c[9]};                           // the world's up, in the camera's space
@@ -671,6 +682,139 @@ void draw_model() {
     glBindVertexArray(vao);
 }
 
+// The frame's effects, after the model: blended, depth-tested, not writing depth (nor the EFB's alpha).
+void draw_fx() {
+    static GLuint prog = 0, buf = 0, fvao = 0, tex = 0, ubo = 0;
+    static uint64_t tex_shown = 0;
+    constexpr uint32_t kMaxCorners = 60000;
+    uint32_t n = 0;
+    for (uint32_t c : fx_counts) n += c;
+    if (!fx_shown || !n || !scene_vp.ok || fx_corners.size() < (size_t)n * 10) return;
+    n = std::min(n, kMaxCorners);
+    {
+        std::lock_guard<std::mutex> lk(fx_mx);
+        if (!fx_layers) return;
+        if (fx_tex_serial != tex_shown) {
+            tex_shown = fx_tex_serial;
+            if (tex) glDeleteTextures(1, &tex);
+            int levels = 1;
+            while ((std::max(fx_tw, fx_th) >> levels) > 0) ++levels;
+            glCreateTextures(GL_TEXTURE_2D_ARRAY, 1, &tex);
+            glTextureStorage3D(tex, levels, GL_RGBA8, fx_tw, fx_th, fx_layers);
+            glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+            glTextureSubImage3D(tex, 0, 0, 0, 0, fx_tw, fx_th, fx_layers, GL_RGBA, GL_UNSIGNED_BYTE, fx_tex.data());
+            glGenerateTextureMipmap(tex);
+            glTextureParameteri(tex, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
+            glTextureParameteri(tex, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+            glTextureParameteri(tex, GL_TEXTURE_WRAP_S, GL_REPEAT);
+            glTextureParameteri(tex, GL_TEXTURE_WRAP_T, GL_REPEAT);
+        }
+    }
+    if (!buf) {
+        glCreateBuffers(1, &buf);
+        glNamedBufferStorage(buf, (GLsizeiptr)kMaxCorners * 40, nullptr, GL_DYNAMIC_STORAGE_BIT);
+        glCreateBuffers(1, &ubo);
+        glNamedBufferStorage(ubo, 24 * 4, nullptr, GL_DYNAMIC_STORAGE_BIT);
+        glCreateVertexArrays(1, &fvao);
+        glVertexArrayVertexBuffer(fvao, 0, buf, 0, 10 * 4);
+        const GLint size[4] = {3, 2, 1, 4};                      // x y z, u v, the layer, r g b a
+        const GLuint at[4] = {0, 12, 20, 24};
+        for (GLuint a = 0; a < 4; ++a) {
+            glEnableVertexArrayAttrib(fvao, a);
+            glVertexArrayAttribFormat(fvao, a, size[a], GL_FLOAT, GL_FALSE, at[a]);
+            glVertexArrayAttribBinding(fvao, a, 0);
+        }
+    }
+    glNamedBufferSubData(buf, 0, (GLsizeiptr)n * 40, fx_corners.data());
+    if (!prog) {
+        prog = link(
+            "#version 450\n"
+            "layout(location = 0) in vec3 a_pos;\n"
+            "layout(location = 1) in vec2 a_uv;\n"
+            "layout(location = 2) in float a_tex;\n"
+            "layout(location = 3) in vec4 a_col;\n"
+            "layout(std140, binding = 10) uniform Fx { vec4 mv[3]; vec4 pr0; vec4 pr1; vec4 vp; };\n"
+            "out vec2 uv;\n"
+            "out float layer;\n"
+            "out vec4 col;\n"
+            "void main() {\n"
+            "    vec4 p = vec4(a_pos, 1.0);\n"
+            "    vec3 pos = vec3(dot(mv[0], p), dot(mv[1], p), dot(mv[2], p));\n"
+            "    vec4 clip = vec4(pr0.x * pos.x + pr0.y * pos.z, pr0.z * pos.y + pr0.w * pos.z, pr1.x * pos.z + pr1.y, -pos.z);\n"
+            "    clip.z = clip.w * vp.x + clip.z * vp.y;\n"
+            "    if (vp.z < 0.0) clip.x = -clip.x;\n"
+            "    if (vp.w < 0.0) clip.y = -clip.y;\n"
+            "    gl_Position = clip;\n"
+            "    uv = a_uv;\n"
+            "    layer = a_tex;\n"
+            "    col = a_col;\n"
+            "}\n",
+            "#version 450\n"
+            "in vec2 uv;\n"
+            "in float layer;\n"
+            "in vec4 col;\n"
+            "layout(binding = 15) uniform sampler2DArray tex;\n"
+            "out vec4 o;\n"
+            "void main() {\n"
+            "    float l = layer;\n"
+            "    bool half_alpha = l > 999.5;\n"                        // its alpha read as half
+            "    if (half_alpha) l -= 1000.0;\n"
+            "    vec4 t = l > -0.5 ? texture(tex, vec3(uv, floor(l + 0.5))) : vec4(1.0);\n"
+            "    if (half_alpha) t.a = 0.5;\n"
+            "    o = clamp(col * t, 0.0, 1.0);\n"
+            "    if (o.a < 0.004) discard;\n"
+            "}\n");
+        if (!prog) { fx_shown = false; return; }
+    }
+    float ub[24];
+    for (int i = 0; i < 12; ++i) ub[i] = fx_view[i];
+    for (int i = 0; i < 6; ++i) ub[12 + i] = fx_proj[i];
+    ub[18] = ub[19] = 0.0f;
+    ub[20] = scene_vp.farz / 16777216.0f;
+    ub[21] = scene_vp.zrange / 16777216.0f;
+    ub[22] = scene_vp.sx;
+    ub[23] = scene_vp.sy;
+    glNamedBufferSubData(ubo, 0, sizeof ub, ub);
+    glBindBufferBase(GL_UNIFORM_BUFFER, 10, ubo);
+    glBindFramebuffer(GL_FRAMEBUFFER, efb_fbo);
+    glViewportIndexedf(0, scene_vp.x, scene_vp.y, scene_vp.w, scene_vp.h);
+    glDisable(GL_SCISSOR_TEST);
+    glEnable(GL_DEPTH_TEST);
+    glDepthFunc(GL_LEQUAL);
+    glDepthMask(GL_FALSE);
+    glColorMask(1, 1, 1, 0);
+    glDisable(GL_COLOR_LOGIC_OP);
+    glDisable(GL_CULL_FACE);
+    glUseProgram(prog);
+    glBindTextureUnit(15, tex);
+    glBindSampler(15, 0);
+    glBindVertexArray(fvao);
+    glEnable(GL_BLEND);
+    GLint first = 0;
+    for (int mode = 0; mode < 5; ++mode) {
+        GLsizei count = (GLsizei)fx_counts[mode];
+        if (count) {
+            switch (mode) {
+            case 0: glBlendEquation(GL_FUNC_ADD); glBlendFuncSeparate(GL_ONE, GL_ZERO, GL_ONE, GL_ZERO); break;   // opaque
+            case 1: glBlendEquation(GL_FUNC_ADD);                                                                  // alpha
+                    glBlendFuncSeparate(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA, GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA); break;
+            case 2: glBlendEquation(GL_FUNC_ADD); glBlendFuncSeparate(GL_SRC_ALPHA, GL_ONE, GL_SRC_ALPHA, GL_ONE); break;  // added
+            case 3: glBlendEquation(GL_FUNC_REVERSE_SUBTRACT);                                                     // subtracted
+                    glBlendFuncSeparate(GL_SRC_ALPHA, GL_ONE, GL_SRC_ALPHA, GL_ONE); break;
+            default: glBlendEquation(GL_FUNC_ADD);                                                                 // darkened
+                     glBlendFuncSeparate(GL_ZERO, GL_ONE_MINUS_SRC_ALPHA, GL_ZERO, GL_ONE_MINUS_SRC_ALPHA); break;
+            }
+            glDrawArrays(GL_TRIANGLES, first, count);
+        }
+        first += count;
+    }
+    glBlendEquation(GL_FUNC_ADD);
+    glDisable(GL_BLEND);
+    glDepthMask(GL_TRUE);
+    glColorMask(1, 1, 1, 1);
+    glBindVertexArray(vao);
+}
+
 void efb_dump(const char* tag) {
     static int k = 0;
     std::vector<uint8_t> px((size_t)EFB_W * S * EFB_H * S * 4);   // top row first, as the EFB is kept
@@ -694,6 +838,8 @@ void efb_copy(uint32_t v) {
         Tex& t = xfbs[dest];
         ensure_tex(t, w * S, h * S, 1);
         draw_model();                                            // a port's model, into the scene
+        draw_fx();                                               // and its effects
+        fx_shown = false;
         {                                                        // each frame its own: a frame with no
             std::lock_guard<std::mutex> lk(model_mx);            // model recorded, or no 3D scene, shows none
             model_visible = false;
@@ -1128,6 +1274,17 @@ void exec(const std::vector<uint8_t>& data) {
             ++model_joints_serial;
             model_visible = vis;
             model_shown = vis;
+            break;
+        }
+        case VC_FX: {                                                // the port's effects in this frame
+            uint32_t n = 0;
+            for (int i = 0; i < 5; ++i) n += fx_counts[i] = rd<uint32_t>(p);
+            std::memcpy(fx_view, p, sizeof fx_view);
+            std::memcpy(fx_proj, p + sizeof fx_view, sizeof fx_proj);
+            p += sizeof fx_view + sizeof fx_proj;
+            fx_corners.assign(reinterpret_cast<const float*>(p), reinterpret_cast<const float*>(p) + (size_t)n * 10);
+            p += (size_t)n * 10 * 4;
+            fx_shown = true;
             break;
         }
         default: rt_die("video: bad record byte %02X", p[-1]);
@@ -1930,6 +2087,19 @@ void video_take_mouse_motion(float& dx, float& dy) {
     std::lock_guard<std::mutex> lk(motion_mx);
     dx = motion_x; dy = motion_y;
     motion_x = motion_y = 0;
+}
+
+void video_fx_textures(const uint8_t* rgba, int layers, int w, int h) {
+    std::lock_guard<std::mutex> lk(fx_mx);
+    if (!rgba || layers <= 0 || w <= 0 || h <= 0) {
+        fx_layers = 0;
+        return;
+    }
+    fx_tex.assign(rgba, rgba + (size_t)w * h * layers * 4);
+    fx_layers = layers;
+    fx_tw = w;
+    fx_th = h;
+    ++fx_tex_serial;
 }
 
 void video_model_shading(float gain, float ground) {
