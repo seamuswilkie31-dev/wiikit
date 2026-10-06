@@ -51,8 +51,11 @@ std::vector<uint8_t> tmem(1 << 20);                // texture memory: only palet
 struct Stats { uint64_t cmds, draws, verts, dls, copies, frames, done, uploads; } st;
 
 // WIIKIT_GXTRACE=N: every command of frame N (counted in XFB copies) to
-// gxtrace_N.txt; F12 in the window asks for the next frame the same way
+// gxtrace_N.txt; F12 in the window asks for the next frame the same way. Each draw notes where its
+// vertices are in the camera's space; each texture drawn with is kept as gxtrace_N_tex_ADDR.png.
 std::atomic<bool> trace_next{false};
+long trace_frame = -1;                              // the frame being traced
+std::set<uint64_t> trace_texs;                      // its textures kept so far
 FILE* trace_file() {
     static long want = std::getenv("WIIKIT_GXTRACE") ? std::atol(std::getenv("WIIKIT_GXTRACE")) : -1;
     static FILE* f = nullptr;
@@ -68,6 +71,8 @@ FILE* trace_file() {
         char name[64];
         std::snprintf(name, sizeof name, "gxtrace_%ld.txt", want);
         f = std::fopen(name, "w");
+        trace_frame = want;
+        trace_texs.clear();
     }
     return f;
 }
@@ -240,6 +245,16 @@ void bind_map(int m) {
         pal = &tmem[toff];
         tfmt = tlut >> 10 & 3;
         th = hash_mem(pal, n) ^ tfmt;
+    }
+    if (FILE* tf = trace_file()) {
+        std::fprintf(tf, "TEX %d %08X %dx%d f%u\n", m, addr, w, h, fmt);
+        if (trace_texs.insert((uint64_t)addr << 32 ^ th ^ (img0 & 0xFFFFFF)).second) {
+            std::vector<uint8_t> px((size_t)w * h * 4);
+            gxtex_decode(fmt, w, h, src, px.data(), pal, tfmt);
+            char name[96];
+            std::snprintf(name, sizeof name, "gxtrace_%ld_tex_%08X_%dx%d_f%u.png", trace_frame, addr, w, h, fmt);
+            write_png(name, w, h, px.data());
+        }
     }
     TexKey key{addr, fmt | (uint32_t)w << 4 | (uint32_t)h << 16, (uint32_t)levels, th};
     auto [it, fresh] = tcache.try_emplace(key, TexEntry{tex_next_id, 0, 0});
@@ -597,6 +612,21 @@ size_t parse(const uint8_t* p, size_t n, bool in_dl) {
                 g_vperf.vtx += (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count();
             } else {
                 fl = decode_vertices(f, p + 3, count, out);
+            }
+            if (FILE* tf = trace_file()) {                      // where it is: its vertices' middle and extent
+                float lo[3] = {1e30f, 1e30f, 1e30f}, hi[3] = {-1e30f, -1e30f, -1e30f};
+                for (uint32_t k = 0; k < count; ++k) {
+                    const float* mx = reinterpret_cast<const float*>(&xf[(uint32_t)out[k].mtx[0] * 4]);
+                    for (int r = 0; r < 3; ++r) {
+                        float c = mx[4 * r] * out[k].pos[0] + mx[4 * r + 1] * out[k].pos[1] +
+                                  mx[4 * r + 2] * out[k].pos[2] + mx[4 * r + 3];
+                        lo[r] = std::min(lo[r], c);
+                        hi[r] = std::max(hi[r], c);
+                    }
+                }
+                std::fprintf(tf, "  AT %.0f %.0f %.0f  SIZE %.0f %.0f %.0f  COL %02X%02X%02X%02X\n", (lo[0] + hi[0]) / 2,
+                             (lo[1] + hi[1]) / 2, (lo[2] + hi[2]) / 2, hi[0] - lo[0], hi[1] - lo[1], hi[2] - lo[2],
+                             out[0].col[0][0], out[0].col[0][1], out[0].col[0][2], out[0].col[0][3]);
             }
             if (extend && rec[draw_hdr + 2] != fl) {      // other attributes: a draw of its own
                 const uint8_t hdr[7] = {VC_DRAW, (uint8_t)(op & 0xF8), 0, 0, 0, 0, 0};

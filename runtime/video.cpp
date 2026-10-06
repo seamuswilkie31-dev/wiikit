@@ -345,6 +345,36 @@ float ground_shade = 1.0f;
 float kGroundRef = 0.8f, kGroundMin = 0.2f;
 std::atomic<float> model_gain{0.0f}, model_ground{0.0f};   // video_model_shading (0: unlit)
 
+// A port model's round shadow (video_model_shadow): a soft dark disc on the ground under it that follows
+// the ground, drawn after the model (draw_shadow). As the scenery is drawn, probe_ground lays a grid of
+// rays around the model's feet (where they were the frame before: the game's camera follows the model,
+// so in the camera's space that is about where they are now), each finding the highest ground beneath;
+// each of the disc's corners takes the height there, so it lies along a slope instead of sinking in.
+std::atomic<float> shadow_radius{0.0f}, shadow_dark{0.0f}, shadow_drop{0.0f};
+constexpr int kShadowGrid = 9;                               // rays a side
+struct ShadowGrid {
+    bool set = false;                                        // laid out this frame
+    float o[3], up[3], e1[3], e2[3];                         // the camera's space: the feet, the world's up, across
+    float half;                                              // the grid's half-width
+    float elev[kShadowGrid * kShadowGrid];                   // each ray's ground: its height above o
+    bool hit[kShadowGrid * kShadowGrid];
+} shadow_grid;
+
+// the world's up in the camera's space, and two ways across the ground (the camera's x flattened, and
+// the one square to both); false with no camera
+bool ground_axes(const float* cam, float up[3], float e1[3], float e2[3]) {
+    float l = std::sqrt(cam[1] * cam[1] + cam[5] * cam[5] + cam[9] * cam[9]);
+    if (l < 0.5f) return false;
+    for (int k = 0; k < 3; ++k) up[k] = cam[1 + 4 * k] / l;
+    float d = up[0];                                         // (1 0 0) less its up
+    e1[0] = 1.0f - d * up[0], e1[1] = -d * up[1], e1[2] = -d * up[2];
+    l = std::sqrt(e1[0] * e1[0] + e1[1] * e1[1] + e1[2] * e1[2]);
+    if (l < 1e-3f) e1[0] = 0.0f, e1[1] = 0.0f, e1[2] = 1.0f, l = 1.0f;
+    for (int k = 0; k < 3; ++k) e1[k] /= l;
+    e2[0] = e1[1] * up[2] - e1[2] * up[1], e2[1] = e1[2] * up[0] - e1[0] * up[2], e2[2] = e1[0] * up[1] - e1[1] * up[0];
+    return true;
+}
+
 // A port's effects: their textures (any thread hands them over: fx_mx), and the frame's triangles as
 // recorded (the renderer's own, replayed and drawn on its thread).
 std::mutex fx_mx;
@@ -364,6 +394,16 @@ void probe_ground(uint8_t prim, const uint8_t* pieces, uint32_t npieces) {
     if ((env & 0xFFFF) != 0xF8AF || (env >> 16 & 7) != 0) return;     // (a 0, b TEXC, c RASC, d 0; add, no bias)
     static const float scales[4] = {1.0f, 2.0f, 4.0f, 0.5f};
     float scale = scales[env >> 20 & 3];
+    bool shade = model_ground.load(std::memory_order_relaxed) > 0.0f;
+    float sr = shadow_radius.load(std::memory_order_relaxed);
+    ShadowGrid& g = shadow_grid;
+    if (sr > 0.0f && !g.set && ground_axes(c, g.up, g.e1, g.e2)) {
+        g.set = true;
+        float drop = shadow_drop.load(std::memory_order_relaxed);
+        for (int k = 0; k < 3; ++k) g.o[k] = model_view[3 + 4 * k] - drop * g.up[k];
+        g.half = 1.5f * sr;
+        std::fill(std::begin(g.hit), std::end(g.hit), false);
+    }
     uint32_t cc = xf[0x100E];
     float lit[3] = {1.0f, 1.0f, 1.0f};
     if (cc >> 1 & 1) {                                          // lit by the ambient alone
@@ -394,7 +434,38 @@ void probe_ground(uint8_t prim, const uint8_t* pieces, uint32_t npieces) {
                 vp[i * 6 + 3 + k] = col[k] / 255.0f;
             }
         }
-        auto tri = [&](uint32_t ia, uint32_t ib, uint32_t ic) {    // Moller-Trumbore, the ray down
+        // the shadow's grid: the triangle seen from above, and each ray within it its height there
+        auto grid_tri = [&](uint32_t ia, uint32_t ib, uint32_t ic) {
+            const float* P[3] = {&vp[ia * 6], &vp[ib * 6], &vp[ic * 6]};
+            float x[3], z[3], y[3];
+            for (int k = 0; k < 3; ++k) {
+                float d[3] = {P[k][0] - g.o[0], P[k][1] - g.o[1], P[k][2] - g.o[2]};
+                x[k] = d[0] * g.e1[0] + d[1] * g.e1[1] + d[2] * g.e1[2];
+                z[k] = d[0] * g.e2[0] + d[1] * g.e2[1] + d[2] * g.e2[2];
+                y[k] = d[0] * g.up[0] + d[1] * g.up[1] + d[2] * g.up[2];
+            }
+            float x0 = std::min({x[0], x[1], x[2]}), x1 = std::max({x[0], x[1], x[2]});
+            float z0 = std::min({z[0], z[1], z[2]}), z1 = std::max({z[0], z[1], z[2]});
+            if (x1 < -g.half || x0 > g.half || z1 < -g.half || z0 > g.half) return;
+            float area = (x[1] - x[0]) * (z[2] - z[0]) - (x[2] - x[0]) * (z[1] - z[0]);
+            if (std::fabs(area) < 1e-3f) return;                       // a wall, seen edge on
+            float step = 2.0f * g.half / (kShadowGrid - 1);
+            int i0 = std::max(0, (int)std::ceil((x0 + g.half) / step)), i1 = std::min(kShadowGrid - 1, (int)std::floor((x1 + g.half) / step));
+            int j0 = std::max(0, (int)std::ceil((z0 + g.half) / step)), j1 = std::min(kShadowGrid - 1, (int)std::floor((z1 + g.half) / step));
+            for (int j = j0; j <= j1; ++j)
+                for (int i = i0; i <= i1; ++i) {
+                    float px = -g.half + (float)i * step, pz = -g.half + (float)j * step;
+                    float w1 = ((px - x[0]) * (z[2] - z[0]) - (x[2] - x[0]) * (pz - z[0])) / area;
+                    float w2 = ((x[1] - x[0]) * (pz - z[0]) - (px - x[0]) * (z[1] - z[0])) / area;
+                    float w0 = 1.0f - w1 - w2;
+                    if (w0 < -1e-4f || w1 < -1e-4f || w2 < -1e-4f) continue;
+                    float h = w0 * y[0] + w1 * y[1] + w2 * y[2];
+                    if (h > 60.0f || h < -340.0f) continue;              // from 60 above the feet, 400 down
+                    int k = j * kShadowGrid + i;
+                    if (!g.hit[k] || h > g.elev[k]) g.hit[k] = true, g.elev[k] = h;
+                }
+        };
+        auto ray = [&](uint32_t ia, uint32_t ib, uint32_t ic) {    // Moller-Trumbore, the ray down
             const float *A = &vp[ia * 6], *B = &vp[ib * 6], *C = &vp[ic * 6];
             float e1[3] = {B[0] - A[0], B[1] - A[1], B[2] - A[2]}, e2[3] = {C[0] - A[0], C[1] - A[1], C[2] - A[2]};
             float pv[3] = {d[1] * e2[2] - d[2] * e2[1], d[2] * e2[0] - d[0] * e2[2], d[0] * e2[1] - d[1] * e2[0]};
@@ -412,6 +483,10 @@ void probe_ground(uint8_t prim, const uint8_t* pieces, uint32_t npieces) {
             ground_frame.t = t;
             for (int k = 0; k < 3; ++k)
                 ground_frame.rgb[k] = ((1.0f - u - w) * A[3 + k] + u * B[3 + k] + w * C[3 + k]) * lit[k] * scale;
+        };
+        auto tri = [&](uint32_t ia, uint32_t ib, uint32_t ic) {
+            if (shade) ray(ia, ib, ic);
+            if (g.set) grid_tri(ia, ib, ic);
         };
         switch (prim) {
         case 0x80: case 0x88: for (uint32_t k = 0; k + 3 < n; k += 4) { tri(k, k + 1, k + 2); tri(k, k + 2, k + 3); } break;
@@ -815,6 +890,151 @@ void draw_fx() {
     glBindVertexArray(vao);
 }
 
+// The model's round shadow on the ground the grid found (none found: flat at its feet), its rings fading
+// as FFXI's shadow does (its texture, system kage_tex in ROM/27/81, measured across: 1, .77, .48, .19, 0 a
+// quarter of the way apart), a little above the ground and drawn a little nearer the camera than it is,
+// so the ground between the rays doesn't cover it. Darkens what's under it; depth-tested, not written.
+void draw_shadow() {
+    static GLuint prog = 0, buf = 0, svao = 0, ubo = 0;
+    constexpr int kSegs = 24, kRings = 5, kCorners = kSegs * 3 * (2 * kRings - 3);
+    float r = shadow_radius.load(std::memory_order_relaxed), dark = shadow_dark.load(std::memory_order_relaxed);
+    float view[12], proj[6], cam[12];
+    {
+        std::lock_guard<std::mutex> lk(model_mx);
+        if (!model_visible || !scene_vp.ok || !(r > 0.0f) || !(dark > 0.0f)) return;
+        std::memcpy(view, model_view, sizeof view);
+        std::memcpy(proj, model_proj, sizeof proj);
+        std::memcpy(cam, model_camera, sizeof cam);
+    }
+    ShadowGrid g = shadow_grid;
+    if (!g.set) {                                              // no ground drawn: flat at the feet
+        if (!ground_axes(cam, g.up, g.e1, g.e2)) return;
+        float drop = shadow_drop.load(std::memory_order_relaxed);
+        for (int k = 0; k < 3; ++k) g.o[k] = view[3 + 4 * k] - drop * g.up[k];
+        g.half = 1.5f * r;
+        std::fill(std::begin(g.hit), std::end(g.hit), false);
+    }
+    // a ray that found no ground takes its neighbours' (a few times over), else the rest's middle, else 0
+    constexpr int G = kShadowGrid;
+    float sum = 0.0f;
+    int hits = 0;
+    for (int k = 0; k < G * G; ++k)
+        if (g.hit[k]) sum += g.elev[k], ++hits;
+    for (int pass = 0; pass < 3 && hits && hits < G * G; ++pass) {
+        ShadowGrid h = g;
+        for (int j = 0; j < G; ++j)
+            for (int i = 0; i < G; ++i) {
+                if (g.hit[j * G + i]) continue;
+                float s = 0.0f;
+                int m = 0;
+                for (int dj = -1; dj <= 1; ++dj)
+                    for (int di = -1; di <= 1; ++di) {
+                        int a = i + di, b = j + dj;
+                        if (a >= 0 && a < G && b >= 0 && b < G && g.hit[b * G + a]) s += g.elev[b * G + a], ++m;
+                    }
+                if (m) h.elev[j * G + i] = s / (float)m, h.hit[j * G + i] = true;
+            }
+        g = h;
+    }
+    for (int k = 0; k < G * G; ++k)
+        if (!g.hit[k]) g.elev[k] = hits ? sum / (float)hits : 0.0f;
+    auto height = [&](float x, float z) {                      // the grid's, between its rays
+        float step = 2.0f * g.half / (G - 1);
+        float fi = std::clamp((x + g.half) / step, 0.0f, (float)(G - 1)), fj = std::clamp((z + g.half) / step, 0.0f, (float)(G - 1));
+        int i = std::min((int)fi, G - 2), j = std::min((int)fj, G - 2);
+        float u = fi - (float)i, v = fj - (float)j;
+        return (1 - u) * (1 - v) * g.elev[j * G + i] + u * (1 - v) * g.elev[j * G + i + 1] +
+               (1 - u) * v * g.elev[(j + 1) * G + i] + u * v * g.elev[(j + 1) * G + i + 1];
+    };
+    float mid[3] = {view[3] - g.o[0], view[7] - g.o[1], view[11] - g.o[2]};
+    float mx = mid[0] * g.e1[0] + mid[1] * g.e1[1] + mid[2] * g.e1[2], mz = mid[0] * g.e2[0] + mid[1] * g.e2[1] + mid[2] * g.e2[2];
+    static const float ring_r[kRings] = {0.0f, 0.25f, 0.5f, 0.75f, 1.0f}, ring_a[kRings] = {1.0f, 0.77f, 0.48f, 0.19f, 0.0f};
+    static std::vector<float> out;
+    out.resize((size_t)kCorners * 4);
+    int n = 0;
+    auto corner = [&](int ring, int seg) {
+        float t = 6.2831853f * (float)(seg % kSegs) / kSegs, rr = r * ring_r[ring];
+        float x = mx + rr * std::cos(t), z = mz + rr * std::sin(t), y = height(x, z) + 1.5f;
+        float p[3];
+        for (int k = 0; k < 3; ++k) p[k] = g.o[k] + x * g.e1[k] + z * g.e2[k] + y * g.up[k];
+        float l = std::sqrt(p[0] * p[0] + p[1] * p[1] + p[2] * p[2]);   // 4 units nearer the camera
+        float s = l > 8.0f ? (l - 4.0f) / l : 1.0f;
+        float* o = &out[(size_t)n++ * 4];
+        o[0] = p[0] * s, o[1] = p[1] * s, o[2] = p[2] * s, o[3] = dark * ring_a[ring];
+    };
+    for (int k = 0; k < kSegs; ++k) {
+        corner(0, k), corner(1, k), corner(1, k + 1);
+        for (int ring = 1; ring + 1 < kRings; ++ring) {
+            corner(ring, k), corner(ring + 1, k), corner(ring + 1, k + 1);
+            corner(ring, k), corner(ring + 1, k + 1), corner(ring, k + 1);
+        }
+    }
+    if (!buf) {
+        glCreateBuffers(1, &buf);
+        glNamedBufferStorage(buf, (GLsizeiptr)kCorners * 16, nullptr, GL_DYNAMIC_STORAGE_BIT);
+        glCreateBuffers(1, &ubo);
+        glNamedBufferStorage(ubo, 12 * 4, nullptr, GL_DYNAMIC_STORAGE_BIT);
+        glCreateVertexArrays(1, &svao);
+        glVertexArrayVertexBuffer(svao, 0, buf, 0, 16);
+        glEnableVertexArrayAttrib(svao, 0);
+        glVertexArrayAttribFormat(svao, 0, 4, GL_FLOAT, GL_FALSE, 0);
+        glVertexArrayAttribBinding(svao, 0, 0);
+    }
+    if (!prog) {
+        prog = link(
+            "#version 450\n"
+            "layout(location = 0) in vec4 a;\n"                     // x y z in the camera's space, alpha
+            "layout(std140, binding = 10) uniform Shadow { vec4 pr0; vec4 pr1; vec4 vp; };\n"
+            "out float alpha;\n"
+            "void main() {\n"
+            "    vec3 pos = a.xyz;\n"
+            "    vec4 clip = vec4(pr0.x * pos.x + pr0.y * pos.z, pr0.z * pos.y + pr0.w * pos.z, pr1.x * pos.z + pr1.y, -pos.z);\n"
+            "    clip.z = clip.w * vp.x + clip.z * vp.y;\n"
+            "    if (vp.z < 0.0) clip.x = -clip.x;\n"
+            "    if (vp.w < 0.0) clip.y = -clip.y;\n"
+            "    gl_Position = clip;\n"
+            "    alpha = a.w;\n"
+            "}\n",
+            "#version 450\n"
+            "in float alpha;\n"
+            "out vec4 o;\n"
+            "void main() {\n"
+            "    if (alpha < 0.004) discard;\n"
+            "    o = vec4(0.0, 0.0, 0.0, alpha);\n"
+            "}\n");
+        if (!prog) { shadow_radius.store(0.0f); return; }
+    }
+    glNamedBufferSubData(buf, 0, (GLsizeiptr)n * 16, out.data());
+    float ub[12];
+    for (int i = 0; i < 6; ++i) ub[i] = proj[i];
+    ub[6] = ub[7] = 0.0f;
+    ub[8] = scene_vp.farz / 16777216.0f;
+    ub[9] = scene_vp.zrange / 16777216.0f;
+    ub[10] = scene_vp.sx;
+    ub[11] = scene_vp.sy;
+    glNamedBufferSubData(ubo, 0, sizeof ub, ub);
+    glBindBufferBase(GL_UNIFORM_BUFFER, 10, ubo);
+    glBindFramebuffer(GL_FRAMEBUFFER, efb_fbo);
+    glViewportIndexedf(0, scene_vp.x, scene_vp.y, scene_vp.w, scene_vp.h);
+    glDisable(GL_SCISSOR_TEST);
+    glEnable(GL_DEPTH_TEST);
+    glDepthFunc(GL_LEQUAL);
+    glDepthMask(GL_FALSE);
+    glColorMask(1, 1, 1, 0);
+    glDisable(GL_COLOR_LOGIC_OP);
+    glDisable(GL_CULL_FACE);
+    glUseProgram(prog);
+    glBindVertexArray(svao);
+    glEnable(GL_BLEND);
+    glBlendEquation(GL_FUNC_ADD);
+    glBlendFuncSeparate(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA, GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    glDrawArrays(GL_TRIANGLES, 0, n);
+    glDisable(GL_BLEND);
+    glDepthMask(GL_TRUE);
+    glColorMask(1, 1, 1, 1);
+    glBindVertexArray(vao);
+}
+
 void efb_dump(const char* tag) {
     static int k = 0;
     std::vector<uint8_t> px((size_t)EFB_W * S * EFB_H * S * 4);   // top row first, as the EFB is kept
@@ -838,6 +1058,7 @@ void efb_copy(uint32_t v) {
         Tex& t = xfbs[dest];
         ensure_tex(t, w * S, h * S, 1);
         draw_model();                                            // a port's model, into the scene
+        draw_shadow();                                           // its shadow
         draw_fx();                                               // and its effects
         fx_shown = false;
         {                                                        // each frame its own: a frame with no
@@ -845,6 +1066,7 @@ void efb_copy(uint32_t v) {
             model_visible = false;
             light_frame_ok = false;                              // and the lights it caught,
             ground_frame = Ground{};                             // and the ground under it
+            shadow_grid.set = false;
         }
         scene_vp.ok = false;
         glDisable(GL_SCISSOR_TEST);
@@ -1022,7 +1244,8 @@ void draw(uint8_t prim, uint8_t vflags, const uint8_t* pieces, uint32_t npieces)
     if (!(vflags & VTX_PNMTX) && (vflags & VTX_COL0) && tri && xf[0x1026] == 0 && (xf[0x1009] & 3) &&
         (xf[0x100E] & 1) && (!(xf[0x100E] >> 1 & 1) || !((xf[0x100E] >> 2 & 15) | (xf[0x100E] >> 11 & 15))) &&
         (bp[0x00] >> 10 & 15) == 0 && !(bp[0x41] & 1) && (bp[0x40] >> 4 & 1) &&
-        model_shown && model_ground.load(std::memory_order_relaxed) > 0.0f)   // (solid: no blending, depth written)
+        model_shown && (model_ground.load(std::memory_order_relaxed) > 0.0f ||
+                        shadow_radius.load(std::memory_order_relaxed) > 0.0f))    // (solid: no blending, depth written)
         probe_ground(prim, pieces, npieces);                   // the scenery, its light baked: under the model?
     if (tri && cull == 3) return;
     vflags &= (uint8_t)~VTX_PNMTX;
@@ -2100,6 +2323,12 @@ void video_fx_textures(const uint8_t* rgba, int layers, int w, int h) {
     fx_tw = w;
     fx_th = h;
     ++fx_tex_serial;
+}
+
+void video_model_shadow(float radius, float darkness, float drop) {
+    shadow_radius.store(radius > 0.0f ? radius : 0.0f, std::memory_order_relaxed);
+    shadow_dark.store(std::clamp(darkness, 0.0f, 1.0f), std::memory_order_relaxed);
+    shadow_drop.store(drop, std::memory_order_relaxed);
 }
 
 void video_model_shading(float gain, float ground) {

@@ -147,6 +147,10 @@ void video_model_frame(const float view[12], const float proj[6], bool visible, 
 // dims it (0: not at all, as the game's own characters; 1: as dark as the ground). Any thread; 0 and
 // 0 at first: unlit.
 void video_model_shading(float gain, float ground);
+// The model's round shadow: a soft dark disc `radius` across on the ground under it, lying along the
+// ground's slope, `darkness` (0 to 1) in its middle; drop: how far its feet are below its origin, in the
+// world's units. radius 0: none (at first). Any thread.
+void video_model_shadow(float radius, float darkness, float drop);
 
 // A port's effects (particles: a spell's light, a hit's sparks), drawn into
 // the game's scene after its model, depth-tested against it and not
