@@ -667,10 +667,11 @@ void gx_trace_next_frame() { trace_next = true; }
 void video_set_frame_hook(void (*fn)()) { frame_hook = fn; }
 
 void video_model_frame(const float view[12], const float proj[6], bool visible, const float* joints, int n,
-                       const float* camera) {
+                       const float* camera, int slot) {
     if (!video) return;
     n = std::clamp(n, 0, 128);
     put<uint8_t>(VC_MODEL);
+    put<uint8_t>((uint8_t)std::clamp(slot, 0, 255));
     put<uint8_t>(visible ? 1 : 0);
     put<uint16_t>((uint16_t)n);
     std::memcpy(grow(12 * 4), view, 12 * 4);

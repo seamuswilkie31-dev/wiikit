@@ -19,8 +19,8 @@
 //   FRAME   (an XFB copy was recorded: one frame)
 //   DRAWDONE (the game asked to know when the GP has drawn everything so
 //            far: the renderer, reaching it, raises PE's finish interrupt)
-//   MODEL   u8 visible, u16 n, 12 f32 view, 6 f32 projection, 12 f32 camera,
-//           n x 12 f32 joints: a port's model as this frame shows it (video_model_frame)
+//   MODEL   u8 slot, u8 visible, u16 n, 12 f32 view, 6 f32 projection, 12 f32 camera,
+//           n x 12 f32 joints: one of a port's models as this frame shows it (video_model_frame)
 //   FX      5 u32 counts, 12 f32 view, 6 f32 projection, the corners (10 f32
 //           each): a port's effects as this frame shows them (video_fx_frame)
 #pragma once
@@ -126,8 +126,9 @@ void video_overlay_update(const uint8_t* rgba, int w, int h);
 // its own skinned models (its characters): with the lights of the last one
 // drawn in the frame, or, in a frame with none, the last ones seen, kept
 // where they were in the world (by the camera, video_model_frame). Unlit
-// until the game has drawn one.
-void video_model_mesh(const float* verts, int n, const uint8_t* rgba, int layers, int w, int h);
+// until the game has drawn one. slot: which of the port's models (0: its own, the player's; 1-5 others,
+// companions: drawn the same way, in the same light).
+void video_model_mesh(const float* verts, int n, const uint8_t* rgba, int layers, int w, int h, int slot = 0);
 // fn is called on the game's thread as each frame is done (the XFB copy, as
 // the game asks for it), before that copy is recorded: the moment the
 // game's memory holds what the frame showed. It may call video_model_frame.
@@ -140,7 +141,7 @@ void video_set_frame_hook(void (*fn)());
 // the world's space to the camera's (3x4, rows; null: none). Not drawn in a
 // frame that records none, or visible false.
 void video_model_frame(const float view[12], const float proj[6], bool visible, const float* joints, int n,
-                       const float* camera = nullptr);
+                       const float* camera = nullptr, int slot = 0);
 // How the model is shaded. gain: how bright its textures are under the game's light (lit, each texel
 // times the light times gain; 1: as the game's own, 2: textures made for twice the light, as FFXI's;
 // 0: not lit at all, its textures as they are). ground: how much the scenery's baked light under it
@@ -150,7 +151,8 @@ void video_model_shading(float gain, float ground);
 // The model's round shadow: a soft dark disc `radius` across on the ground under it, lying along the
 // ground's slope, `darkness` (0 to 1) in its middle; drop: how far its feet are below its origin, in the
 // world's units. radius 0: none (at first). Any thread.
-void video_model_shadow(float radius, float darkness, float drop);
+// slot: as video_model_mesh's; the others' flat at their feet.
+void video_model_shadow(float radius, float darkness, float drop, int slot = 0);
 
 // A port's effects (particles: a spell's light, a hit's sparks), drawn into
 // the game's scene after its model, depth-tested against it and not
