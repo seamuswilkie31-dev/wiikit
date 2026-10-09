@@ -360,6 +360,7 @@ struct Ground { bool hit = false; float t = 0.0f, rgb[3] = {}; } ground_frame;
 float ground_shade = 1.0f;
 float kGroundRef = 0.8f, kGroundMin = 0.2f;
 std::atomic<float> model_gain{0.0f}, model_ground{0.0f};   // video_model_shading (0: unlit)
+std::atomic<float> model_aura[kModelSlots];                 // video_model_aura (0: none)
 
 // A port model's round shadow (video_model_shadow): a soft dark disc on the ground under it that follows
 // the ground, drawn after the model (draw_shadow). As the scenery is drawn, probe_ground lays a grid of
@@ -847,7 +848,8 @@ void draw_model() {
             "        for (int i = 0; i < info.x; ++i) acc += light(i, v_pos, n);\n"
             "        rgb *= mat.rgb * clamp(acc, 0.0, 1.0);\n"
             "    }\n"
-            "    col = vec4(rgb * shade.rgb, 1.0);\n"
+            "    if (pr1.w > 0.0) rgb = mix(rgb, vec3(1.0), 0.2);\n"   // an aura's copy: paler,
+            "    col = vec4(rgb * shade.rgb, pr1.w > 0.0 ? pr1.w : 1.0);\n"   // see-through
             "}\n");
         if (!prog) {
             std::lock_guard<std::mutex> lk(model_mx);
@@ -898,6 +900,45 @@ void draw_model() {
         glBindTextureUnit(15, g.tex);
         glVertexArrayVertexBuffer(mvao, 0, g.vbuf, 0, kModelVertFloats * 4);
         glDrawArrays(GL_TRIANGLES, 0, g.n);
+    }
+    // the auras (video_model_aura): three copies each side, shifted across the view and swaying, a little
+    // behind the model (so seen only where it isn't), blended, not writing depth nor the EFB's alpha
+    static const auto t0 = std::chrono::steady_clock::now();
+    float t = std::chrono::duration<float>(std::chrono::steady_clock::now() - t0).count();
+    bool blended = false;
+    for (int s = 0; s < kModelSlots; ++s) {
+        float aura = model_aura[s].load(std::memory_order_relaxed);
+        if (!drawn[s] || !(aura > 0.0f)) continue;
+        if (!blended) {
+            blended = true;
+            glEnable(GL_BLEND);
+            glBlendEquation(GL_FUNC_ADD);
+            glBlendFuncSeparate(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA, GL_ZERO, GL_ONE);
+            glDepthMask(GL_FALSE);
+            glColorMask(1, 1, 1, 0);
+        }
+        const Gl& g = gls[s];
+        glBindBufferBase(GL_UNIFORM_BUFFER, 8, g.jubo);
+        glBindTextureUnit(15, g.tex);
+        glVertexArrayVertexBuffer(mvao, 0, g.vbuf, 0, kModelVertFloats * 4);
+        for (int k = 0; k < 6; ++k) {
+            int i = k / 2;
+            float side = (k & 1) ? -0.55f : 1.0f;                // more to one side, as the afterimages trail
+            float sway = 0.65f + 0.35f * std::sin(t * (2.3f + 0.4f * (float)i) + 1.9f * (float)k);
+            float ub[24];
+            std::memcpy(ub, ubs[s], sizeof ub);
+            ub[3] += side * (7.0f + 7.0f * (float)i) * sway;     // across the view, in the world's units
+            ub[7] += 2.5f * std::sin(t * 3.1f + (float)k);       // and a little up and down
+            ub[11] -= 4.0f + (float)i;                           // just behind it
+            ub[19] = aura * (0.34f - 0.09f * (float)i) * ((k & 1) ? 0.7f : 1.0f);
+            glNamedBufferSubData(ubo, 0, sizeof ub, ub);
+            glDrawArrays(GL_TRIANGLES, 0, g.n);
+        }
+    }
+    if (blended) {
+        glDisable(GL_BLEND);
+        glDepthMask(GL_TRUE);
+        glColorMask(1, 1, 1, 1);
     }
     glBindVertexArray(vao);
 }
@@ -2477,6 +2518,11 @@ void video_model_shadow(float radius, float darkness, float drop, int slot) {
         other_shadow[slot][1].store(darkness, std::memory_order_relaxed);
         other_shadow[slot][2].store(drop, std::memory_order_relaxed);
     }
+}
+
+void video_model_aura(float strength, int slot) {
+    if (slot < 0 || slot >= kModelSlots) return;
+    model_aura[slot].store(std::clamp(strength, 0.0f, 1.0f), std::memory_order_relaxed);
 }
 
 void video_model_shading(float gain, float ground) {

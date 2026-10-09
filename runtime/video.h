@@ -153,6 +153,9 @@ void video_model_shading(float gain, float ground);
 // world's units. radius 0: none (at first). Any thread.
 // slot: as video_model_mesh's; the others' flat at their feet.
 void video_model_shadow(float radius, float darkness, float drop, int slot = 0);
+// The model's aura (a GM's, in FFXI): faint copies of it either side, swaying across the view, seen where
+// it isn't (just behind it), blended over the scene; strength 0 to 1 (0: none, at first). Any thread.
+void video_model_aura(float strength, int slot = 0);
 
 // A port's effects (particles: a spell's light, a hit's sparks), drawn into
 // the game's scene after its model, depth-tested against it and not
