@@ -848,7 +848,7 @@ void draw_model() {
             "        for (int i = 0; i < info.x; ++i) acc += light(i, v_pos, n);\n"
             "        rgb *= mat.rgb * clamp(acc, 0.0, 1.0);\n"
             "    }\n"
-            "    if (pr1.w > 0.0) rgb = mix(rgb, vec3(1.0), 0.2);\n"   // an aura's copy: paler,
+            "    if (pr1.w > 0.0) rgb = mix(rgb, vec3(0.16), 0.6);\n"  // an aura's copy: a dark grey,
             "    col = vec4(rgb * shade.rgb, pr1.w > 0.0 ? pr1.w : 1.0);\n"   // see-through
             "}\n");
         if (!prog) {
@@ -930,7 +930,7 @@ void draw_model() {
             ub[3] += side * (7.0f + 7.0f * (float)i) * sway;     // across the view, in the world's units
             ub[7] += 2.5f * std::sin(t * 3.1f + (float)k);       // and a little up and down
             ub[11] -= 4.0f + (float)i;                           // just behind it
-            ub[19] = aura * (0.34f - 0.09f * (float)i) * ((k & 1) ? 0.7f : 1.0f);
+            ub[19] = aura * (0.22f - 0.06f * (float)i) * ((k & 1) ? 0.7f : 1.0f);
             glNamedBufferSubData(ubo, 0, sizeof ub, ub);
             glDrawArrays(GL_TRIANGLES, 0, g.n);
         }
